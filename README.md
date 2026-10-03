@@ -3,7 +3,7 @@
 Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy from the shell.
 
 - **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails.
-- **Manage:** virtual keys (generate, update limits, block, rotate, delete), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend.
+- **Manage:** virtual keys (generate, update limits, block, rotate, delete), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend.
 - **Audit:**
   - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
   - `fleet diff` compares proxies behind one VIP.
@@ -21,6 +21,9 @@ cli-anything-litellm teams create --alias eng --team-id team-eng --models qwen -
 cli-anything-litellm users create --user-id svc-bot --email svc@corp.io --teams eng --max-budget 5
 cli-anything-litellm budgets create --budget-id eng-2026 --max-budget 100 --duration 30d --model-max-budget '{"gpt-4o": 0.01}'
 cli-anything-litellm keys generate --alias svc --user svc-bot --team team-eng --rpm 60 --budget-id eng-2026
+cli-anything-litellm customers create --user-id cust-x --alias acme --budget-id eng-2026
+cli-anything-litellm customers list --budget eng-2026          # end users, capped by the shared budget
+cli-anything-litellm customers block acme --yes                # their user_id stops working, reversibly
 cli-anything-litellm budgets info eng-2026   # the budget and every key/team on it
 cli-anything-litellm budgets update eng-2026 --max-budget 200   # re-prices every attached key
 cli-anything-litellm drift --config litellm/config.yaml

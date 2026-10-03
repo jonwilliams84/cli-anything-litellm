@@ -9,8 +9,8 @@ of a real LiteLLM v1.100.1 proxy.
 | File | Scope |
 |---|---|
 | `tests/test_harness.py` | Original build: core (`models`, `drift`, `lint`, `backend`) and CLI behaviours (dry-run, confirm, rotation, spend grouping, 401 hint). |
-| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused) and `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match). |
-| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow) and the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow). |
+| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused). |
+| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -101,6 +101,36 @@ of a real LiteLLM v1.100.1 proxy.
   shows the attached key → `budgets update` re-prices the fleet in one call →
   `budgets delete --yes`.
 
+## Customer management coverage (`customers ...`, v0.6.0)
+
+- `customers list` reads `/customer/list`, follows its pagination when the
+  proxy sends the `{"customers": [...], "total_pages": ...}` envelope, and
+  tolerates the bare-list shape older proxies return
+  (`core/customers.as_rows`); `--json` rows are the `normalize` shape
+  (user_id, alias, spend, budget, caps, blocked) and `--budget ID` filters
+  client-side.
+- `customers info <user_id|alias>` resolves an alias against the live list
+  first (`/customer/info` is keyed by `user_id` alone).
+- `customers create` builds the `/customer/new` body: `--user-id` (what the
+  app passes with each request), `--alias`, `--max-budget`, `--budget-id`
+  (a shared budget), `--rpm`, `--tpm`. A customer with neither a user id nor
+  an alias is refused client-side — the proxy would generate an id nobody
+  knows. `--dry-run` prints the exact body.
+- `customers update <user_id|alias>` resolves the ref first (unknown → error
+  pointing at `customers list`), requires something to change, and omits
+  unset fields.
+- `customers block` / `customers unblock` send `/customer/block` /
+  `/customer/unblock` with `{"user_ids": [id]}`; block is destructive-gated
+  (`--yes` off a TTY).
+- `customers delete <user_id|alias>` sends `{"user_ids": [id]}` — the
+  plural body the family's write endpoints share (`ids_body`), unlike the
+  budget family whose delete alone says `id`. Refuses without `--yes` off a
+  TTY; deleting a customer stops spend attribution for that end user and
+  deletes no key.
+- Workflow: `customers create --budget-id` → `customers list --budget` shows
+  the customer on the cap → `customers block` → `customers info` shows
+  `blocked: true` → `customers unblock` → `customers delete --yes`.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 109 passed, 82.74% coverage (v0.5.0).
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 134 passed, 84.6% coverage (v0.6.0).

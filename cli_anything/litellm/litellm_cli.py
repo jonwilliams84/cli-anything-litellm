@@ -19,6 +19,7 @@ import yaml
 from cli_anything.litellm import __version__
 from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import budgets as budgets_mod
+from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import models as models_mod
@@ -1054,6 +1055,175 @@ def budgets_delete(ctx, budget_id, yes):
     _confirm(ctx, yes, f"delete budget {budget_id}")
     _call(be.post, c, "/budget/delete", body)
     _emit(ctx, {"deleted": budget_id}, None)
+
+
+# ── customers ───────────────────────────────────────────────────────────────
+
+
+CUSTOMER_COLS = [
+    ("user_id", "USER_ID"),
+    ("alias", "ALIAS"),
+    ("spend", "SPEND"),
+    ("max_budget", "BUDGET"),
+    ("budget_id", "BUDGET_ID"),
+    ("tpm_limit", "TPM"),
+    ("rpm_limit", "RPM"),
+    ("blocked", "BLOCKED"),
+]
+
+CUSTOMERS_PAGE = 100
+
+
+@cli.group("customers")
+def customers_grp():
+    """End users of the app behind the proxy: per-user spend caps and blocks.
+
+    A customer is identified by the `user_id` apps pass with each request —
+    spend is tracked against it live, capped by `--max-budget` (inline or a
+    shared `--budget-id`), and stops the moment `customers block` is run.
+    """
+
+
+def all_customers(conn, budget: str | None = None) -> list[dict]:
+    """Every customer, following /customer/list pagination (same loop as keys/users)."""
+    out, page = [], 1
+    while True:
+        res = be.get(conn, "/customer/list", params={"page": page, "size": CUSTOMERS_PAGE}) or {}
+        rows = customers_mod.as_rows(res)  # a bare list (older proxies) has no page envelope
+        if budget:
+            rows = [c for c in rows if c.get("budget_id") == budget]
+        out += rows
+        total = (res.get("total_pages") or 1) if isinstance(res, dict) else 1
+        if page >= total:
+            return out
+        page += 1
+
+
+def _resolve_customer(conn, ref: str) -> dict[str, Any]:
+    """The live customer record for `ref` (user_id or unique alias), or a Click error."""
+    t = customers_mod.resolve_customer_target(_call(all_customers, conn), ref)
+    if not t:
+        raise click.ClickException(f"no live customer matches {ref!r} — run `customers list`")
+    return t["customer"]
+
+
+@customers_grp.command("list")
+@click.option("--budget", default=None, help="Only customers on this shared budget id.")
+@click.pass_context
+def customers_list(ctx, budget):
+    rows = [customers_mod.normalize(c) for c in _call(all_customers, _conn(ctx), budget)]
+    _emit(ctx, rows, lambda r: _table(r, CUSTOMER_COLS))
+
+
+@customers_grp.command("info")
+@click.argument("customer_ref")
+@click.pass_context
+def customers_info(ctx, customer_ref):
+    """By user id or unique alias, straight from /customer/info."""
+    c = _conn(ctx)
+    # /customer/info is keyed by user_id; an alias is resolved to one first.
+    user_id = customers_mod.resolve_customer_target(_call(all_customers, c), customer_ref)
+    user_id = user_id["matches"][0] if user_id else customer_ref
+    res = _call(be.get, c, "/customer/info", params={"user_id": user_id})
+    _emit(
+        ctx, res, lambda r: _table([customers_mod.normalize(r)] if isinstance(r, dict) else r, CUSTOMER_COLS)
+    )
+
+
+@customers_grp.command("create")
+@click.option("--user-id", default=None, help="What the app passes as user_id on each request.")
+@click.option("--alias", default=None, help="Human label shown in tables and spend reports.")
+@click.option("--max-budget", type=float, default=None, help="Hard spend cap per reset period.")
+@click.option("--budget-id", "budget_id", default=None, help="Attach a shared budget (`budgets create`).")
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.pass_context
+def customers_create(ctx, user_id, alias, max_budget, budget_id, rpm, tpm):
+    """POST /customer/new. Apps pass `user_id` with requests to be capped and tracked."""
+    try:
+        body = customers_mod.new_customer(user_id, alias, max_budget, budget_id, rpm, tpm)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/customer/new", body):
+        return
+    res = _call(be.post, _conn(ctx), "/customer/new", body)
+    _emit(
+        ctx,
+        res,
+        lambda r: click.echo(
+            f"  created {(r.get('user_id') if isinstance(r, dict) else None) or user_id or alias}"
+        ),
+    )
+
+
+@customers_grp.command("update")
+@click.argument("customer_ref")
+@click.option("--alias", default=None)
+@click.option("--max-budget", type=float, default=None)
+@click.option(
+    "--budget-id",
+    "budget_id",
+    default=None,
+    help="Shared budget (`budgets create`) — overrides --max-budget.",
+)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.pass_context
+def customers_update(ctx, customer_ref, alias, max_budget, budget_id, rpm, tpm):
+    """POST /customer/update. Given flags replace the field; omitted ones stay as-is."""
+    c = _conn(ctx)
+    user_id = _resolve_customer(c, customer_ref)["user_id"]
+    try:
+        body = customers_mod.update_customer(
+            user_id, alias=alias, max_budget=max_budget, budget_id=budget_id, rpm=rpm, tpm=tpm
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/customer/update", body):
+        return
+    _emit(ctx, _call(be.post, c, "/customer/update", body))
+
+
+def _simple_customer_action(name: str, path: str, destructive: bool):
+    @customers_grp.command(name)
+    @click.argument("customer_ref")
+    @click.option("--yes", is_flag=True)
+    @click.pass_context
+    def _cmd(ctx, customer_ref, yes):
+        c = _conn(ctx)
+        user_id = _resolve_customer(c, customer_ref)["user_id"]
+        body = customers_mod.ids_body([user_id])
+        if _dry(ctx, "POST", path, body):
+            return
+        if destructive:
+            _confirm(ctx, yes, f"{name} customer {customer_ref}")
+        _emit(ctx, _call(be.post, c, path, body), lambda r: click.echo(f"  {name}ed customer {user_id}"))
+
+    _cmd.__doc__ = {
+        "block": "Block a customer (every key request that names their user_id fails); reversible with unblock.",
+        "unblock": "Unblock a customer.",
+    }[name]
+    return _cmd
+
+
+_simple_customer_action("block", "/customer/block", True)
+_simple_customer_action("unblock", "/customer/unblock", False)
+
+
+@customers_grp.command("delete")
+@click.argument("customer_ref")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def customers_delete(ctx, customer_ref, yes):
+    """POST /customer/delete. Stops spend attribution for the user; deletes no key."""
+    c = _conn(ctx)
+    user_id = _resolve_customer(c, customer_ref)["user_id"]
+    body = customers_mod.ids_body([user_id])
+    if _dry(ctx, "POST", "/customer/delete", body):
+        return
+    _confirm(ctx, yes, f"delete customer {customer_ref}")
+    _call(be.post, c, "/customer/delete", body)
+    _emit(ctx, {"deleted": body}, None)
 
 
 # ── users ───────────────────────────────────────────────────────────────────

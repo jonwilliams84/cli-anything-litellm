@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.6.0] — 2026-10-03
+
+Customer (end-user) management: spend control gets its sixth leg, next to keys,
+teams, users, budgets and spend.
+
+A *customer* in LiteLLM is an end user of the app behind the proxy — the
+`user_id` the app passes with every request. The proxy attributes spend to that
+id live, caps it with `max_budget` (inline or a shared `budget_id`) and
+`tpm`/`rpm` limits, and can fail every request that names it with one
+`blocked` switch — charge one app user without minting them a key. Until now
+those customers could only be created or changed in the Admin UI, and the CLI
+could not even list them. The new `customers` group covers the whole
+`/customer/*` family:
+
+- **`customers list`** — GET `/customer/list`, following the proxy's
+  pagination when it comes as `{"customers": [...], "total_pages": ...}` and
+  tolerating the bare-list shape older proxies return; `--budget F` filters to
+  customers on one shared cap. One row per end user: alias, spend, budget,
+  caps, blocked.
+- **`customers info <user_id|alias>`** — GET `/customer/info`. Keyed by
+  `user_id` alone, so a unique alias is resolved against the live list first.
+- **`customers create`** — POST `/customer/new` with `--user-id` (what the app
+  passes with each request), `--alias`, `--max-budget`, `--budget-id` (a
+  `budgets create` cap applies to end users too), `--rpm` and `--tpm`. A
+  customer with neither a user id nor an alias is refused client-side: the
+  proxy would generate an id nobody can find later, the way an implicitly
+  minted key without an alias hides in audits. `--dry-run` prints the exact body.
+- **`customers update <user_id|alias>`** — POST `/customer/update`; given
+  flags replace the field, omitted ones stay as-is. The ref is resolved against
+  the live list first (unknown → error pointing at `customers list`), and a
+  `--budget-id` here makes the shared cap override an inline `max_budget`.
+- **`customers block` / `customers unblock <user_id|alias>`** — POST
+  `/customer/block` and `/customer/unblock` with `{"user_ids": [id]}`. Blocking
+  fails every request that names the end user's `user_id`, reversibly; the
+  block needs `--yes` off a TTY.
+- **`customers delete <user_id|alias>`** — POST `/customer/delete` with
+  `{"user_ids": [id]}` — the family's write endpoints all speak plural, unlike
+  the budget family where delete alone says `id`. Destructive: needs `--yes`
+  off a TTY. Deleting a customer stops spend attribution for that end user; it
+  deletes no key.
+- Core: `core/customers.py` (`as_rows`, `normalize`, `new_customer`,
+  `update_customer`, `ids_body`, `resolve_customer_target`), unit-tested in
+  `tests/test_core.py`; E2E and a
+  create→budget→block→unblock→delete workflow in `tests/test_full_e2e.py`.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands
+  and the plural-deletion quirk they pair with.
+
 ## [0.5.0] — 2026-10-03
 
 Budget management: the fifth leg of spend control, next to keys, teams, users and spend.
