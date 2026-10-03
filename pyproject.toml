@@ -1,13 +1,33 @@
 [tool.ruff]
 target-version = "py310"
 line-length = 110
+extend-exclude = [".venv", "build", "dist"]
 
 [tool.ruff.lint]
+# Unchanged from this repo's original policy. Deliberately NOT picking up the
+# fleet's extra DTZ/ASYNC selections: those fire on existing code here
+# (date.today() in the spend command), and widening a repo's rule set is not
+# what an onboarding change should do.
 select = ["E", "F", "S", "B", "RUF"]
-ignore = ["S101", "E501", "RUF001", "RUF002", "RUF003"]
+ignore = ["S101", "E501", "RUF001", "RUF002", "RUF003", "RUF100"]
+
+# Codes handled by the advisory security-scan run rather than this blocking one.
+# Declaring them external stops RUF100 treating their `# noqa` as dead weight.
+external = ["BLE001", "UP", "I001", "SIM", "C4", "PTH", "RET", "ARG"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S105", "S106"]   # fixtures deliberately contain fake keys / masked values
+# Tests legitimately do things that are findings in production code.
+"tests/*" = ["S101", "S105", "S106", "S603", "S607", "S108"]
+# .github/scripts/ is shared fleet boilerplate (publish_findings.py and the
+# SARIF converters), carried verbatim from the other cli-anything repos and not
+# written to this project's rule set. ci.yml scopes its ruff run to
+# cli_anything/ for the same reason; this keeps a bare `ruff check .` clean for
+# anyone who runs it by hand.
+".github/scripts/*" = ["S603", "S607", "E401", "F401", "S314", "S108"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
