@@ -129,3 +129,68 @@ def replica_inconsistencies(deps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             variants = sorted(shapes.values(), key=len, reverse=True)
             issues.append({"model_name": name, "majority": variants[0], "odd_ones": variants[1:]})
     return issues
+
+
+def new_deployment(
+    name: str,
+    model: str,
+    *,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    mode: str | None = None,
+    max_input_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Body for ``POST /model/new`` — a DB-only deployment, as the Admin UI would create it.
+
+    ``model`` is the LiteLLM provider string (``hosted_vllm/qwen``, ``openai/gpt-4o``,
+    …). Pass ``os.environ/NAME`` in ``api_key`` so the secret is resolved by the
+    proxy, never stored in its database. ``mode`` is a model capability class
+    (chat, embedding, …) and defaults server-side to chat.
+
+    Raises ``ValueError`` (surfaced as a Click error) when ``name`` or ``model``
+    is missing.
+    """
+    if not name or not model:
+        raise ValueError("models add needs both --name (model group) and --model (litellm provider string)")
+    lp: dict[str, Any] = {"model": model}
+    if api_base:
+        lp["api_base"] = api_base
+    if api_key:
+        lp["api_key"] = api_key
+    mi: dict[str, Any] = {}
+    if mode:
+        mi["mode"] = mode
+    if max_input_tokens is not None:
+        mi["max_input_tokens"] = max_input_tokens
+    out: dict[str, Any] = {
+        "model_name": name,
+        "litellm_params": lp,
+        "model_info": mi,
+    }
+    if not mi:
+        out.pop("model_info")
+    return out
+
+
+def resolve_model_target(deps: list[dict[str, Any]], ref: str) -> dict[str, Any] | None:
+    """What ``models delete`` would remove for ``ref`` (a deployment id or a model group name).
+
+    An exact ``model_info.id`` match deletes one replica; a ``model_name`` match
+    deletes every replica of the group — including ones the config still
+    describes (they come back on the next config redeploy; DB-only ones do not).
+    Returns ``{"by": "id"|"model_name", "matches": [...]}`` or ``None`` when no
+    live deployment matches.
+    """
+    if ref and ref in {dep_id(d) for d in deps}:
+        return {
+            "by": "id",
+            "matches": [ref],
+            "db_model": is_db_model(next(d for d in deps if dep_id(d) == ref)),
+        }
+    if ref and ref in {d.get("model_name") for d in deps}:
+        return {
+            "by": "model_name",
+            "matches": [ref],
+            "db_model": any(is_db_model(d) for d in deps if d.get("model_name") == ref),
+        }
+    return None

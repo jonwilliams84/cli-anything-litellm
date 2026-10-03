@@ -45,11 +45,13 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Keys: list / inspect | `keys list [--team T]`, `keys info <alias|sk-…|hash>` |
 | Keys: issue / limit | `keys generate --alias A --models m1,m2 --duration 90d --max-budget 5 --rpm 60`, `keys update A --rpm 30` |
 | Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A`, `keys delete A` |
+| Add a model **as a DB row** (what the Admin UI does) | `models add --name G --model hosted_vllm/qwen --api-base http://n1:8000/v1 --api-key os.environ/K [--mode chat] [--max-input-tokens N]` |
+| Remove a DB deployment (by id) or a whole group (by name) | `models delete <model|id>` (`drift` first — config-backed replicas come back on redeploy) |
 | Teams | `teams list`, `teams info <team_id>` |
 | Who is using it / what does it cost? | `spend --days 7 --by model|key|team|user` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
-nothing). `block`, `rotate`, `delete` need `--yes` when there is no TTY.
+nothing). `block`, `rotate`, `delete` and `models delete` need `--yes` when there is no TTY.
 
 ## Workflow for any change
 
@@ -68,7 +70,10 @@ nothing). `block`, `rotate`, `delete` need `--yes` when there is no TTY.
 - **DB-only models.** Models added through the Admin UI or `/model/new` (needs
   `STORE_MODEL_IN_DB`) live in the database, not the file. They survive a config
   redeploy and never appear in git. `drift` reports them as `only_live` with
-  `db_model: true`.
+  `db_model: true`. Manage them from the shell: `models add` (POST /model/new —
+  pass `--api-key os.environ/NAME` so the secret stays out of the proxy's DB) and
+  `models delete` (POST /model/delete — a `model_info.id` removes one replica, a
+  model group name removes every replica of it).
 - **401 behind a VIP.** If only some requests 401, the nodes have different
   master keys. `fleet diff` names the node that rejects the key.
 - **Version / cache / callbacks** moved to the authenticated

@@ -321,6 +321,77 @@ def models_consistency(ctx):
     _emit(ctx, {"consistent": not issues, "issues": issues})
 
 
+@models_grp.command("add")
+@click.option("--name", required=True, help="Model group clients request.")
+@click.option("--model", required=True, help="LiteLLM provider string, e.g. hosted_vllm/qwen.")
+@click.option("--api-base", default=None, help="Backend base URL, e.g. http://n1:8000/v1.")
+@click.option("--api-key", default=None, help="Backend key; use os.environ/NAME so the proxy resolves it.")
+@click.option(
+    "--mode",
+    default=None,
+    type=click.Choice(
+        ["chat", "embedding", "completion", "image_generation", "audio_transcription", "rerank"]
+    ),
+)
+@click.option("--max-input-tokens", "max_input_tokens", type=int, default=None)
+@click.pass_context
+def models_add(ctx, name, model, api_base, api_key, mode, max_input_tokens):
+    """Add a deployment to the proxy's database (POST /model/new).
+
+    What the Admin UI does, from the shell — a DB-only model: it survives a
+    config redeploy and `drift` will report it as `only_live / db_model`, so it
+    belongs in git too if it must live forever.
+    """
+    try:
+        body = models_mod.new_deployment(
+            name, model, api_base=api_base, api_key=api_key, mode=mode, max_input_tokens=max_input_tokens
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/model/new", body):
+        return
+    res = _call(be.post, _conn(ctx), "/model/new", body) or {}
+    _emit(
+        ctx,
+        res,
+        lambda r: click.echo(
+            f"  added {name} ({((r.get('data') or {}).get('model_info') or {}).get('id', 'id unknown')})"
+        ),
+    )
+
+
+@models_grp.command("delete")
+@click.argument("model_or_id")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def models_delete(ctx, model_or_id, yes):
+    """Remove a deployment from the proxy's database (POST /model/delete).
+
+    MODEL_OR_ID is a deployment id (deletes one replica) or a model group name
+    (deletes every replica of it). Use `drift --config` first: a deployment the
+    config still describes comes back on the next redeploy; a DB-only one does
+    not come back.
+    """
+    c = _conn(ctx)
+    deps = _call(live_deployments, c)
+    target = models_mod.resolve_model_target(deps, model_or_id)
+    if not target:
+        raise click.ClickException(
+            f"no live deployment matches {model_or_id!r} (see `models list --deployments`)"
+        )
+    body = {target["by"]: model_or_id}
+    kind = (
+        f"model group {model_or_id} (all {sum(1 for d in deps if d.get('model_name') == model_or_id)} replicas)"
+        if target["by"] == "model_name"
+        else f"deployment {model_or_id}"
+    )
+    if _dry(ctx, "POST", "/model/delete", body):
+        return
+    _confirm(ctx, yes, f"delete {kind}")
+    res = _call(be.post, c, "/model/delete", body) or {}
+    _emit(ctx, res, lambda r: click.echo(f"  deleted {kind}: {r.get('message') or 'ok'}"))
+
+
 @cli.group("router")
 def router_grp():
     """Live router settings."""
