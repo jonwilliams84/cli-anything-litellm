@@ -9,8 +9,8 @@ of a real LiteLLM v1.100.1 proxy.
 | File | Scope |
 |---|---|
 | `tests/test_harness.py` | Original build: core (`models`, `drift`, `lint`, `backend`) and CLI behaviours (dry-run, confirm, rotation, spend grouping, 401 hint). |
-| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused) and `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused). |
-| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow) and the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow). |
+| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused) and `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match). |
+| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow) and the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -75,6 +75,32 @@ of a real LiteLLM v1.100.1 proxy.
   → `teams list` shows the member count → `teams delete --yes` names the
   invalidated key.
 
+## Budget management coverage (`budgets ...`, v0.5.0)
+
+- `budgets list` reads `/budget/list` and tolerates both response shapes the
+  proxy has used — a bare list and the `{"data": [...]}` envelope
+  (`core/budgets.as_rows`); `--json` rows are the `normalize` shape (budget_id,
+  caps, reset cycle, tpm/rpm/parallel, per-model caps).
+- `budgets info <budget_id>` fetches `/budget/info` and names the budget plus
+  every key and team referencing it — what a change or delete will hit.
+- `budgets create` builds the `/budget/new` body: optional `--budget-id` (the id
+  `keys generate --budget-id` references), `--max-budget`, `--soft-budget`,
+  `--rpm`, `--tpm`, `--parallel`, `--duration` (reset cycle, e.g. `30d`) and
+  `--model-max-budget` (JSON object of per-model caps — parse errors and
+  non-object JSON are refused client-side). A budget with nothing to cap is a
+  ValueError before the proxy is called. `--dry-run` prints the exact body.
+- `budgets update <budget_id>` resolves the id against `/budget/list` (unknown →
+  error pointing at `budgets list`), requires something to change, omits unset
+  fields.
+- `budgets delete <budget_id>` sends `{"id": ...}` — the one `/budget/*`
+  endpoint that does not say `budget_id`. Refuses without `--yes` off a TTY;
+  `--dry-run` prints the body first.
+- Composition: `keys generate --budget-id` / `keys update --budget-id` attach a
+  shared budget, and `keys rotate` carries `budget_id` over to the key.
+- Workflow: `budgets create` → `keys generate --budget-id` → `budgets info`
+  shows the attached key → `budgets update` re-prices the fleet in one call →
+  `budgets delete --yes`.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 88 passed, 80.79% coverage (v0.4.0).
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 109 passed, 82.74% coverage (v0.5.0).

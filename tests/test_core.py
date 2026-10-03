@@ -261,3 +261,97 @@ def test_team_target_ambiguous_alias_is_refused_not_guessed():
 def test_team_target_unknown_or_empty_is_none():
     assert t.resolve_team_target([team(1)], "ghost") is None
     assert t.resolve_team_target([team(1)], "") is None
+
+
+# ── budgets ───────────────────────────────────────────────────────────────
+
+from cli_anything.litellm.core import budgets as b
+
+
+def budget_row(i, **kw):
+    return {
+        "budget_id": f"bud-{i}",
+        "max_budget": 100.0,
+        "soft_budget": None,
+        "tpm_limit": 20000,
+        "rpm_limit": 60,
+        "max_parallel_requests": None,
+        "budget_duration": "30d",
+        "model_max_budget": None,
+        "created_at": "2026-10-02T00:00:00",
+        **kw,
+    }
+
+
+def test_as_rows_tolerates_list_and_envelopes():
+    rows = [budget_row(1)]
+    assert b.as_rows(rows) == rows
+    assert b.as_rows({"data": rows}) == rows
+    assert b.as_rows({"budgets": rows}) == rows
+    assert b.as_rows({}) == [] and b.as_rows(None) == []
+
+
+def test_normalize_keeps_the_limit_fields():
+    row = b.normalize(budget_row(1, model_max_budget={"gpt-4o": 0.01}))
+    assert row == {
+        "budget_id": "bud-1",
+        "max_budget": 100.0,
+        "soft_budget": None,
+        "budget_duration": "30d",
+        "tpm_limit": 20000,
+        "rpm_limit": 60,
+        "max_parallel_requests": None,
+        "model_max_budget": {"gpt-4o": 0.01},
+    }
+
+
+def test_new_budget_minimal_body_needs_something_to_cap():
+    assert b.new_budget("bud-1", max_budget=100) == {"budget_id": "bud-1", "max_budget": 100}
+    with pytest.raises(ValueError, match="something to cap"):
+        b.new_budget("bud-1")
+
+
+def test_new_budget_full_body_including_per_model_caps():
+    out = b.new_budget(
+        "bud-1", max_budget=100, soft_budget=90, rpm=60, tpm=20000, parallel=5,
+        duration="30d", model_max_budget='{"gpt-4o": 0.01, "qwen": 0.05}',
+    )
+    assert out["budget_id"] == "bud-1"
+    assert out["soft_budget"] == 90 and out["max_parallel_requests"] == 5
+    assert out["budget_duration"] == "30d"
+    assert out["model_max_budget"] == {"gpt-4o": 0.01, "qwen": 0.05}
+
+
+def test_new_budget_accepts_a_dict_and_rejects_bad_json():
+    assert b.new_budget(max_budget=1, model_max_budget={"qwen": 0.5}) == {
+        "max_budget": 1,
+        "model_max_budget": {"qwen": 0.5},
+    }
+    with pytest.raises(ValueError, match="--model-max-budget"):
+        b.new_budget(max_budget=1, model_max_budget="not json")
+    with pytest.raises(ValueError, match="--model-max-budget"):
+        b.new_budget(model_max_budget='["not","an","object"]')
+
+
+def test_update_budget_targets_the_id_and_omits_unset():
+    out = b.update_budget("bud-1", max_budget=200.0, duration="7d")
+    assert out == {"budget_id": "bud-1", "max_budget": 200.0, "budget_duration": "7d"}
+
+
+def test_update_budget_requires_id_and_something_to_change():
+    with pytest.raises(ValueError, match="identify the budget"):
+        b.update_budget("", max_budget=1)
+    with pytest.raises(ValueError, match="something to cap"):
+        b.update_budget("bud-1")
+
+
+def test_resolve_budget_target_is_an_exact_id_check():
+    res = b.resolve_budget_target([budget_row(1), budget_row(2)], "bud-2")
+    assert res["by"] == "budget_id" and res["matches"] == ["bud-2"] and res["budget"]["budget_id"] == "bud-2"
+    assert b.resolve_budget_target([budget_row(1)], "ghost") is None
+    assert b.resolve_budget_target([budget_row(1)], "") is None
+
+
+def test_budget_delete_body_uses_id_not_budget_id():
+    # /budget/delete is the one endpoint of the family that says `id`.
+    assert b.DELETE_KEY == "id"

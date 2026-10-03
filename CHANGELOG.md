@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.5.0] — 2026-10-03
+
+Budget management: the fifth leg of spend control, next to keys, teams, users and spend.
+
+A budget is a reusable cap in the proxy's database — a `max_budget` with an optional
+`soft_budget` warning, a `budget_duration` reset cycle, rate/parallel limits and
+per-model maxima (`model_max_budget`) — that keys reference by `budget_id`. The one
+place to re-price fifty keys next quarter is the budget, not fifty key updates; but
+until now the CLI could not even list those budgets, let alone change them. The new
+`budgets` group covers the whole `/budget/*` family:
+
+- **`budgets list`** — GET `/budget/list`. One row per budget: cap, soft cap, reset
+  cycle, TPM/RPM/parallel limits and per-model caps. Tolerates both response shapes
+  the proxy has used (a bare list, and the `{"data": [...]}` envelope).
+- **`budgets info <budget_id>`** — GET `/budget/info`. The budget plus every key and
+  team that references it, so you know what a change (or a delete) will hit.
+- **`budgets create`** — POST `/budget/new` with `--budget-id` (what
+  `keys generate --budget-id` references — the proxy generates one if omitted),
+  `--max-budget`, `--soft-budget`, `--rpm`, `--tpm`, `--parallel`,
+  `--duration` (the reset cycle, e.g. `30d` — the format
+  `teams create --budget-duration` also takes) and `--model-max-budget` (a JSON
+  object of per-model caps, e.g.
+  `'{\"gpt-4o\": 0.01}'`). A budget with nothing to cap is refused client-side —
+  a no-op budget would only be discovered in `budgets list`. `--dry-run` prints
+  the exact body.
+- **`budgets update <budget_id>`** — POST `/budget/update`. Given flags replace the
+  field; omitted ones stay as-is. Applies immediately to every key, team and user
+  on the budget, and that is the point: the command refuses an unknown id first
+  (pointing at `budgets list`) rather than shipping a change that silently misses.
+- **`budgets delete <budget_id>`** — POST `/budget/delete`. Destructive: needs
+  `--yes` off a TTY. Says `{"id": ...}` — the one endpoint of the family that
+  doesn't say `budget_id`. Attached keys, teams and users keep working with their
+  own limits; they are detached, not deleted.
+- Composition: `keys generate` and `keys update` gained `--budget-id`, and
+  `keys rotate` now carries the budget id over to the replacement key — a rotation
+  used to drop the shared cap and fall back to the key's inline limits.
+- Core: `core/budgets.py` (`as_rows`, `normalize`, `new_budget`, `update_budget`,
+  `resolve_budget_target`), unit-tested in `tests/test_core.py`; E2E and a
+  create→attach→reprice→delete workflow in `tests/test_full_e2e.py`.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands and
+  the budget reference they pair with.
+
 ## [0.4.0] — 2026-10-03
 
 Team management: the fourth leg of identity, next to models, users and keys.

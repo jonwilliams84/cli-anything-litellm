@@ -18,6 +18,7 @@ import yaml
 
 from cli_anything.litellm import __version__
 from cli_anything.litellm.core import backend as be
+from cli_anything.litellm.core import budgets as budgets_mod
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import models as models_mod
@@ -524,10 +525,11 @@ def _resolve_token(conn, key_or_alias: str) -> str:
 @click.option("--models", default=None, help="Comma-separated model groups; default all.")
 @click.option("--duration", default=None, help="e.g. 30d, 12h. Default: no expiry.")
 @click.option("--max-budget", type=float, default=None)
+@click.option("--budget-id", "budget_id", default=None, help="Attach a shared budget (`budgets create`).")
 @click.option("--rpm", type=int, default=None)
 @click.option("--tpm", type=int, default=None)
 @click.pass_context
-def keys_generate(ctx, alias, team, user, models, duration, max_budget, rpm, tpm):
+def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_id, rpm, tpm):
     body = {
         k: v
         for k, v in {
@@ -537,6 +539,7 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, rpm, tpm
             "models": models.split(",") if models else None,
             "duration": duration,
             "max_budget": max_budget,
+            "budget_id": budget_id,
             "rpm_limit": rpm,
             "tpm_limit": tpm,
         }.items()
@@ -552,17 +555,19 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, rpm, tpm
 @click.argument("key_or_alias")
 @click.option("--models", default=None)
 @click.option("--max-budget", type=float, default=None)
+@click.option("--budget-id", "budget_id", default=None, help="Attach a shared budget (`budgets create`).")
 @click.option("--rpm", type=int, default=None)
 @click.option("--tpm", type=int, default=None)
 @click.option("--duration", default=None)
 @click.pass_context
-def keys_update(ctx, key_or_alias, models, max_budget, rpm, tpm, duration):
+def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, duration):
     c = _conn(ctx)
     body = {
         k: v
         for k, v in {
             "models": models.split(",") if models else None,
             "max_budget": max_budget,
+            "budget_id": budget_id,
             "rpm_limit": rpm,
             "tpm_limit": tpm,
             "duration": duration,
@@ -611,6 +616,7 @@ ROTATE_FIELDS = (
     "user_id",
     "models",
     "max_budget",
+    "budget_id",
     "budget_duration",
     "rpm_limit",
     "tpm_limit",
@@ -883,6 +889,171 @@ def _simple_team_action(name: str, path: str, destructive: bool):
 
 _simple_team_action("block", "/team/block", True)
 _simple_team_action("unblock", "/team/unblock", False)
+
+
+# ── budgets ─────────────────────────────────────────────────────────────────
+
+
+BUDGET_COLS = [
+    ("budget_id", "BUDGET"),
+    ("max_budget", "MAX"),
+    ("soft_budget", "SOFT"),
+    ("budget_duration", "RESET"),
+    ("tpm_limit", "TPM"),
+    ("rpm_limit", "RPM"),
+    ("max_parallel_requests", "PARALLEL"),
+]
+
+
+@cli.group("budgets")
+def budgets_grp():
+    """Reusable spend limits that keys, teams and users reference by id.
+
+    A budget carries the cap, reset cycle and per-model maxima that every
+    key attached with `--budget-id` inherits — change it once instead of
+    re-pricing each key.
+    """
+
+
+def all_budgets(conn) -> list[dict]:
+    """The live budgets (the /budget/list rows, whatever envelope they come in)."""
+    return budgets_mod.as_rows(be.get(conn, "/budget/list") or {})
+
+
+def _resolve_budget(conn, budget_id: str) -> dict[str, Any]:
+    """Refuse an unknown budget_id before mutating; budgets have no alias."""
+    t = budgets_mod.resolve_budget_target(_call(all_budgets, conn), budget_id)
+    if not t:
+        raise click.ClickException(f"no live budget matches {budget_id!r} — run `budgets list`")
+    return t["budget"]
+
+
+@budgets_grp.command("list")
+@click.pass_context
+def budgets_list(ctx):
+    rows = [budgets_mod.normalize(b) for b in _call(all_budgets, _conn(ctx))]
+    _emit(ctx, rows, lambda r: _table(r, BUDGET_COLS))
+
+
+@budgets_grp.command("info")
+@click.argument("budget_id")
+@click.pass_context
+def budgets_info(ctx, budget_id):
+    """The budget and every key / team that references it."""
+    res = _call(be.get, _conn(ctx), "/budget/info", params={"budget_id": budget_id})
+    res = res if isinstance(res, dict) else {}
+    row = res.get("info")
+    if row is None:  # some proxies put the row directly in the response
+        row = {k: v for k, v in res.items() if k not in ("keys", "teams")}
+    data = {
+        "budget": budgets_mod.normalize(row),
+        "keys": res.get("keys") or [],
+        "teams": res.get("teams") or [],
+    }
+
+    def human(d):
+        click.echo(f"  keys {len(d['keys'])}  teams {len(d['teams'])} on this budget")
+        for k in d["keys"]:
+            click.echo(f"    key {(k.get('key_alias') or k.get('key_name')) or '?'}")
+
+    _emit(ctx, data, human)
+
+
+@budgets_grp.command("create")
+@click.option(
+    "--budget-id",
+    "budget_id",
+    default=None,
+    help="The id keys reference; the proxy generates one if omitted.",
+)
+@click.option("--max-budget", type=float, default=None, help="Hard spend cap per reset period.")
+@click.option(
+    "--soft-budget", type=float, default=None, help="Warn (or trigger the soft-budget hook) past this."
+)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.option("--parallel", type=int, default=None, help="Max parallel requests per key.")
+@click.option(
+    "--duration", default=None, help="Reset cycle, e.g. 30d — LiteLLM resets max_budget every cycle."
+)
+@click.option(
+    "--model-max-budget",
+    default=None,
+    help="JSON object of per-model caps, e.g. '{\"gpt-4o\": 0.01}'.",
+)
+@click.pass_context
+def budgets_create(ctx, budget_id, max_budget, soft_budget, rpm, tpm, parallel, duration, model_max_budget):
+    """POST /budget/new. Attach keys afterwards: `keys generate --budget-id`."""
+    try:
+        body = budgets_mod.new_budget(
+            budget_id,
+            max_budget=max_budget,
+            soft_budget=soft_budget,
+            rpm=rpm,
+            tpm=tpm,
+            parallel=parallel,
+            duration=duration,
+            model_max_budget=model_max_budget,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/budget/new", body):
+        return
+    res = _call(be.post, _conn(ctx), "/budget/new", body)
+    _emit(ctx, res, lambda r: click.echo(f"  created {(r.get('budget_id') or budget_id) or 'a budget'}"))
+
+
+@budgets_grp.command("update")
+@click.argument("budget_id")
+@click.option("--max-budget", type=float, default=None)
+@click.option("--soft-budget", type=float, default=None)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.option("--parallel", type=int, default=None)
+@click.option("--duration", default=None)
+@click.option(
+    "--model-max-budget",
+    default=None,
+    help="JSON object of per-model caps (replaces the set).",
+)
+@click.pass_context
+def budgets_update(ctx, budget_id, max_budget, soft_budget, rpm, tpm, parallel, duration, model_max_budget):
+    """POST /budget/update. Applies at once to every key, team and user on it."""
+    c = _conn(ctx)
+    _resolve_budget(c, budget_id)
+    try:
+        body = budgets_mod.update_budget(
+            budget_id,
+            max_budget=max_budget,
+            soft_budget=soft_budget,
+            rpm=rpm,
+            tpm=tpm,
+            parallel=parallel,
+            duration=duration,
+            model_max_budget=model_max_budget,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/budget/update", body):
+        return
+    _emit(ctx, _call(be.post, c, "/budget/update", body))
+
+
+@budgets_grp.command("delete")
+@click.argument("budget_id")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def budgets_delete(ctx, budget_id, yes):
+    """POST /budget/delete. Keys, teams and users on it keep working with their own limits."""
+    c = _conn(ctx)
+    _resolve_budget(c, budget_id)
+    # The budget family says budget_id everywhere except delete, which says id.
+    body = {budgets_mod.DELETE_KEY: budget_id}
+    if _dry(ctx, "POST", "/budget/delete", body):
+        return
+    _confirm(ctx, yes, f"delete budget {budget_id}")
+    _call(be.post, c, "/budget/delete", body)
+    _emit(ctx, {"deleted": budget_id}, None)
 
 
 # ── users ───────────────────────────────────────────────────────────────────
