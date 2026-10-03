@@ -460,3 +460,180 @@ def test_workflow_onboard_team_issue_team_key_then_delete_team():
     r = run(["--json", "teams", "delete", "eng", "--yes"], get=get, post=post)
     out = json.loads(r.output)
     assert out["keys_removed"] == [{"alias": "eng-bot", "token": "sk-eng"}]
+
+
+# ── budgets ───────────────────────────────────────────────────────────────
+
+
+def budget_row(i="1", **kw):
+    return {
+        "budget_id": f"bud-{i}",
+        "max_budget": 100.0,
+        "soft_budget": None,
+        "tpm_limit": 20000,
+        "rpm_limit": 60,
+        "max_parallel_requests": None,
+        "budget_duration": "30d",
+        "model_max_budget": None,
+        **kw,
+    }
+
+
+def bud_state(rows):
+    """Stub /budget/list (both the bare-list and envelope shapes) and /budget/info."""
+    state = {"rows": list(rows)}
+
+    def get(c, p, **k):
+        if p == "/budget/list":
+            return state["rows"]  # old proxies return a bare list
+        if p == "/budget/info":
+            hit = next(r for r in state["rows"] if r.get("budget_id") == k["params"]["budget_id"])
+            return {"info": hit, "keys": state.get("keys", []), "teams": [{"team_alias": "eng", "team_id": "t-1"}]}
+        return {}
+
+    return state, get
+
+
+def test_budgets_create_dry_run_prints_body_sends_nothing():
+    post = mock.Mock()
+    r = run(
+        ["--dry-run", "budgets", "create", "--budget-id", "eng-2026", "--max-budget", "100",
+         "--duration", "30d", "--model-max-budget", '{"gpt-4o": 0.01}'],
+        post=post,
+    )
+    assert json.loads(r.output)["body"] == {
+        "budget_id": "eng-2026", "max_budget": 100.0,
+        "budget_duration": "30d", "model_max_budget": {"gpt-4o": 0.01},
+    }
+    assert "POST /budget/new" in r.output
+    post.assert_not_called()
+
+
+def test_budgets_create_with_no_cap_fails_before_the_proxy():
+    post = mock.Mock()
+    r = run(["budgets", "create", "--budget-id", "eng-2026"], post=post)
+    assert r.exit_code != 0 and "something to cap" in r.output
+    post.assert_not_called()
+
+
+def test_budgets_create_posts_and_reports_the_id():
+    post = mock.Mock(return_value={"budget_id": "eng-2026"})
+    r = run(["budgets", "create", "--budget-id", "eng-2026", "--max-budget", "100", "--soft-budget", "90"], post=post)
+    post.assert_called_once_with(mock.ANY, "/budget/new", {"budget_id": "eng-2026", "max_budget": 100.0, "soft_budget": 90.0})
+    assert "created eng-2026" in r.output
+
+
+def test_budgets_list_json_and_envelope_shapes_and_table():
+    state, get = bud_state([budget_row("1"), budget_row("2", max_budget=5.0)])
+    r = run(["--json", "budgets", "list"], get=get)
+    rows = json.loads(r.output)
+    assert [row["budget_id"] for row in rows] == ["bud-1", "bud-2"] and rows[1]["max_budget"] == 5.0
+    r = run(["budgets", "list"], get=lambda c, p, **k: {"data": [budget_row("1")]})  # envelope shape
+    assert "BUDGET" in r.output and "RESET" in r.output
+    post = mock.Mock(return_value={})  # /budget/list is a read; posts must stay absent
+    r = run(["budgets", "list"], get=get, post=post)
+    post.assert_not_called()
+
+
+def test_budgets_info_names_the_keys_and_teams_on_the_budget():
+    state, get = bud_state([budget_row("eng", budget_id="eng-2026")])
+    r = run(["--json", "budgets", "info", "eng-2026"], get=get)
+    out = json.loads(r.output)
+    assert out["budget"]["budget_id"] == "eng-2026" and out["budget"]["max_budget"] == 100.0
+    assert out["keys"] == [] and out["teams"] == [{"team_alias": "eng", "team_id": "t-1"}]
+    state["keys"] = [{"key_alias": "svc", "key_name": "sha-svc"}]
+    r = run(["budgets", "info", "eng-2026"], get=get)
+    assert "keys 1  teams 1 on this budget" in r.output and "svc" in r.output
+    r = run(["budgets", "info", "eng-2026"], get=get)
+    assert "teams 1 on this budget" in r.output
+
+
+def test_budgets_update_unknown_id_is_an_error_before_the_proxy():
+    post = mock.Mock()
+    state, get = bud_state([budget_row("1")])
+    r = run(["budgets", "update", "ghost", "--max-budget", "2"], get=get, post=post)
+    assert r.exit_code != 0 and "no live budget matches 'ghost'" in r.output
+    post.assert_not_called()
+
+
+def test_budgets_update_omits_unset_fields():
+    post = mock.Mock(return_value={"budget_id": "bud-1"})
+    state, get = bud_state([budget_row("1")])
+    r = run(["budgets", "update", "bud-1", "--max-budget", "200", "--duration", "7d"], get=get, post=post)
+    post.assert_called_once_with(mock.ANY, "/budget/update", {"budget_id": "bud-1", "max_budget": 200.0, "budget_duration": "7d"})
+    assert r.exit_code == 0
+
+
+def test_budgets_update_with_nothing_to_change_fails_before_the_proxy():
+    post = mock.Mock()
+    state, get = bud_state([budget_row("1")])
+    r = run(["budgets", "update", "bud-1"], get=get, post=post)
+    assert r.exit_code != 0 and "something to cap" in r.output
+    post.assert_not_called()
+
+
+def test_budgets_delete_dry_run_uses_id_and_needs_yes_off_tty():
+    state, get = bud_state([budget_row("1")])
+    r = run(["--dry-run", "budgets", "delete", "bud-1"], get=get)
+    assert json.loads(r.output)["body"] == {"id": "bud-1"}
+    post = mock.Mock()
+    r = run(["budgets", "delete", "bud-1"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output
+    post.assert_not_called()
+    post = mock.Mock(return_value={})
+    r = run(["budgets", "delete", "bud-1", "--yes"], get=get, post=post)
+    post.assert_called_once_with(mock.ANY, "/budget/delete", {"id": "bud-1"})
+    assert '"deleted"' in r.output
+
+
+def test_keys_generate_and_update_accept_budget_id():
+    post = mock.Mock(return_value={"key": "sk-k"})
+    r = run(["keys", "generate", "--alias", "svc", "--budget-id", "eng-2026"], post=post)
+    body = {"key_alias": "svc", "budget_id": "eng-2026"}
+    post.assert_called_once_with(mock.ANY, "/key/generate", body)
+
+
+def test_rotate_carries_the_budget_id_to_the_new_key():
+    info = {"info": {"key_alias": "svc", "models": ["m"], "budget_id": "eng-2026"}}
+    r = run(["--dry-run", "keys", "rotate", "sk-old"], get=lambda c, p, **k: info)
+    steps = json.loads(r.output)["steps"]
+    assert steps[1]["body"]["budget_id"] == "eng-2026"
+
+
+def test_workflow_budget_create_attach_reprice_delete():
+    """The spend-control story: cap a fleet of keys through one budget."""
+    state, get = bud_state([])
+    state["keys"] = []
+
+    def post(c, path, body=None, **k):
+        if path == "/budget/new":
+            state["rows"].append(dict(body))
+            return dict(body)
+        if path == "/key/generate":
+            state["keys"].append({"key_alias": body["key_alias"], "key_name": "sha-svc"})
+            return {"key": "sk-svc"}
+        if path == "/budget/update":
+            state["rows"][0]["max_budget"] = body["max_budget"]
+            return {"budget_id": body["budget_id"]}
+        if path == "/budget/delete":
+            state["rows"] = [r for r in state["rows"] if r.get("budget_id") != body["id"]]
+            return {}
+        assert False, path
+        return {}
+
+    r = run(["budgets", "create", "--budget-id", "eng-2026", "--max-budget", "100", "--duration", "30d"], get=get, post=post)
+    assert "created eng-2026" in r.output
+
+    r = run(["--json", "keys", "generate", "--alias", "svc", "--budget-id", "eng-2026"], get=get, post=post)
+    assert state["keys"] and state["keys"][0]["key_alias"] == "svc"
+
+    r = run(["--json", "budgets", "info", "eng-2026"], get=get, post=post)
+    out = json.loads(r.output)
+    assert out["budget"]["max_budget"] == 100.0 and out["keys"][0]["key_alias"] == "svc"
+
+    # Re-price every attached key in one update, not one per key.
+    r = run(["--json", "budgets", "update", "eng-2026", "--max-budget", "200"], get=get, post=post)
+    assert state["rows"][0]["max_budget"] == 200.0
+
+    r = run(["budgets", "delete", "eng-2026", "--yes"], get=get, post=post)
+    assert r.exit_code == 0 and state["rows"] == []

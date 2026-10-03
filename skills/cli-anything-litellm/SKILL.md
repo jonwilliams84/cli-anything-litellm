@@ -4,8 +4,9 @@ description: >-
   Administer, tune and audit a LiteLLM proxy from the shell: model groups and
   replicas, live router settings, guardrails, virtual keys (create, limit,
   block, rotate, delete), user accounts (create, update, delete), teams
-  (create, update, members, block, delete) and spend. Detects DRIFT between the
-  config.yaml
+  (create, update, members, block, delete), budgets (reusable spend caps keys
+  reference by budget_id: create, update, delete) and spend. Detects DRIFT between
+  the config.yaml
   in git and the running proxy (including models added through the Admin UI that
   exist only in its database), differences between proxies behind one VIP (the
   mismatched-master-key 401 class), and lints a config against built-in hygiene
@@ -45,8 +46,10 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | **Would this config change break a recorded decision?** | `lint --config … --policy policy.yaml` (exit 1 = errors) |
 | **Are the nodes behind the VIP identical?** | `fleet diff --node URL1 --node URL2` (exit 2 = differ) |
 | Keys: list / inspect | `keys list [--team T]`, `keys info <alias|sk-…|hash>` |
-| Keys: issue / limit | `keys generate --alias A --models m1,m2 --duration 90d --max-budget 5 --rpm 60`, `keys update A --rpm 30` |
-| Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A`, `keys delete A` |
+| Keys: issue / limit | `keys generate --alias A --models m1,m2 --duration 90d --max-budget 5 --rpm 60` (or `--budget-id B` to inherit a shared budget), `keys update A --rpm 30` |
+| Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A` (carries `budget_id` over), `keys delete A` |
+| Budgets: list / inspect | `budgets list`, `budgets info <budget_id>` (also names every key and team on it) |
+| Budgets: create / re-price / remove | `budgets create --budget-id B --max-budget 100 --duration 30d [--soft-budget 90] [--parallel 5] [--model-max-budget '{"gpt-4o": 0.01}']`, `budgets update B --max-budget 200` (hit every attached key, team and user at once), `budgets delete B --yes` (attached keys/teams keep working on their own limits) |
 | Add a model **as a DB row** (what the Admin UI does) | `models add --name G --model hosted_vllm/qwen --api-base http://n1:8000/v1 --api-key os.environ/K [--mode chat] [--max-input-tokens N]` |
 | Remove a DB deployment (by id) or a whole group (by name) | `models delete <model|id>` (`drift` first — config-backed replicas come back on redeploy) |
 | Teams: list / inspect | `teams list`, `teams info <team_id>` |
@@ -60,7 +63,8 @@ cli-anything-litellm config test                  # reachability + auth + versio
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
-`users delete`, `teams block`, `teams delete` need `--yes` when there is no TTY.
+`users delete`, `teams block`, `teams delete`, `budgets delete` need `--yes`
+when there is no TTY.
 
 ## Workflow for any change
 
@@ -112,6 +116,14 @@ nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 - **Roles are LiteLLM's, validated client-side**: `proxy_admin*`, `internal_user*`,
   `team`, `customer`. A typo fails before the proxy's opaque 400 does; `proxy_*`
   roles can mutate the whole proxy — grant them sparingly.
+- **Budgets are the shared way to cap keys.** `budgets create --budget-id B`
+  then `keys generate --budget-id B`: the cap, reset cycle and per-model maxima
+  live in one place, so `budgets update B --max-budget 200` re-prices every
+  attached key, team and user at once instead of fifty `keys update` calls.
+  `/budget/delete` sends `{"id": ...}` — the one `/budget/*` endpoint that does
+  not say `budget_id`. Deleting a budget detaches its keys, teams and users;
+  they keep working under their own inline limits. A `budgets create` with
+  nothing to cap is refused before the proxy is called.
 - **Placeholder credentials** (`api_key: none`) are reported by `lint` as
   `info`, not as leaked secrets: they mean the backend takes no key at all, which
   is worth a deliberate decision.

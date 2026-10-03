@@ -5,7 +5,7 @@ from setuptools import find_namespace_packages, setup
 
 setup(
     name="cli-anything-litellm",
-    version="0.4.0",
+    version="0.5.0",
     description="CLI harness for administering a LiteLLM proxy — models, routing, keys, spend, drift, policy",
     license="MIT",
     packages=find_namespace_packages(include=["cli_anything.*"]),
