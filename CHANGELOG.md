@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.0] — 2026-10-03
+
+User management: the third leg of identity, next to teams and keys.
+
+Every virtual key and spend row is attributed to a user, but the proxy's user
+accounts were only manageable through the Admin UI — onboarding ("give svc-bot
+an account, capped at $5") had to leave the shell. The new `users` group covers
+all five `/user/*` endpoints:
+
+- **`users list`** — GET `/user/get_users`, paginated like `keys list`, filterable
+  with `--role` and `--team`. One row per user: role, teams, budget, spend, blocked.
+- **`users info <name|email>`** — GET `/user/info`; an email is resolved to a
+  user id first (a unique live match is required). Also lists the virtual keys
+  minted for the user.
+- **`users create`** — POST `/user/new` with `--user-id`/`--email`, `--role`
+  (validated against LiteLLM's nine proxy roles before the proxy sees a typo),
+  `--teams`, `--max-budget`, `--rpm`, `--tpm`. Always sets `auto_create_key:
+  false`: a key minted implicitly has no alias, which is an audit dead end —
+  issue keys deliberately with `keys generate --user <id>`. `--dry-run` prints
+  the exact body.
+- **`users update <name|email>`** — POST `/user/update`; given flags replace the
+  field, omitted ones stay as-is.
+- **`users delete <name|email>`** — POST `/user/delete`. Destructive: needs
+  `--yes` off a TTY. Deleting a user also invalidates every key they own, so the
+  command refuses an argument no live user matches (a shared email is refused
+  too — delete by user id) and names the keys that stop working. Run `users
+  info` first to see what is about to break.
+- Core: `core/users.py` (`new_user`, `update_user`, `normalize`,
+  `resolve_user_target`), unit-tested in `tests/test_core.py`; E2E and an
+  onboard→key→delete workflow in `tests/test_full_e2e.py`.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands.
+
 ## [0.2.0] — 2026-10-03
 
 DB-model management: the Admin UI's two mutations from the shell.

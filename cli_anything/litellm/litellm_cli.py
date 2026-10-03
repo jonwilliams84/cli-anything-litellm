@@ -21,6 +21,7 @@ from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import models as models_mod
+from cli_anything.litellm.core import users as users_mod
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -716,6 +717,166 @@ def teams_list(ctx):
 @click.pass_context
 def teams_info(ctx, team_id):
     _emit(ctx, _call(be.get, _conn(ctx), "/team/info", params={"team_id": team_id}))
+
+
+# ── users ───────────────────────────────────────────────────────────────────
+
+USER_COLS = [
+    ("user_id", "USER_ID"),
+    ("email", "EMAIL"),
+    ("role", "ROLE"),
+    ("teams", "TEAMS"),
+    ("spend", "SPEND"),
+    ("max_budget", "BUDGET"),
+    ("blocked", "BLOCKED"),
+]
+
+USERS_PAGE = 100
+
+
+def all_users(conn, team: str | None = None, role: str | None = None) -> list[dict]:
+    """Every user, following /user/get_users pagination (same loop as keys)."""
+    out, page = [], 1
+    while True:
+        res = be.get(conn, "/user/get_users", params={"page": page, "size": USERS_PAGE}) or {}
+        rows = res.get("users") or []
+        if team or role:
+            rows = [
+                u
+                for u in rows
+                if (not team or team in (u.get("teams") or [])) and (not role or u.get("user_role") == role)
+            ]
+        out += rows
+        if page >= (res.get("total_pages") or 1):
+            return out
+        page += 1
+
+
+@cli.group("users")
+def users_grp():
+    """Proxy accounts: roles, team membership, budgets — keys hang off these."""
+
+
+@users_grp.command("list")
+@click.option("--team", default=None, help="Only users on this team (id or alias).")
+@click.option("--role", default=None, help="Only this user_role (e.g. proxy_admin).")
+@click.pass_context
+def users_list(ctx, team, role):
+    rows = [users_mod.normalize(u) for u in _call(all_users, _conn(ctx), team, role)]
+    _emit(ctx, rows, lambda r: _table(r, USER_COLS))
+
+
+@users_grp.command("info")
+@click.argument("user_ref")
+@click.pass_context
+def users_info(ctx, user_ref):
+    """By user name or email; also the virtual keys minted for them."""
+    c = _conn(ctx)
+    # /user/info is keyed by user_id; an email is resolved to a user first.
+    user_id = user_ref
+    if "@" in user_ref:
+        t = users_mod.resolve_user_target(_call(all_users, c), user_ref)
+        if not t:
+            raise click.ClickException(f"no user matches {user_ref!r} — run `users list`")
+        user_id = t["user"]["user_id"]
+    res = _call(be.get, c, "/user/info", params={"user_id": user_id}) or {}
+    _emit(
+        ctx,
+        {
+            "user": users_mod.normalize(res.get("user_info") or res),
+            "keys": [
+                {"alias": k.get("key_alias"), "token": k.get("token"), "expires": k.get("expires")}
+                for k in (res.get("keys") or [])
+            ],
+        },
+    )
+
+
+@users_grp.command("create")
+@click.option("--user-id", default=None, help="User name apps authenticate / own keys as.")
+@click.option("--email", default=None)
+@click.option(
+    "--role",
+    default=None,
+    help=f"LiteLLM role (default: {users_mod.DEFAULT_ROLE}).",
+)
+@click.option("--teams", default=None, help="Comma-separated team ids.")
+@click.option("--max-budget", type=float, default=None)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.pass_context
+def users_create(ctx, user_id, email, role, teams, max_budget, rpm, tpm):
+    """POST /user/new. Never mints a key — issue one with `keys generate --user`."""
+    try:
+        body = users_mod.new_user(user_id, email, role, teams, max_budget, rpm, tpm)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/user/new", body):
+        return
+    res = _call(be.post, _conn(ctx), "/user/new", body)
+    if isinstance(res, dict):
+        res = {"created": res.get("user_id") or user_id or email, **res}
+    _emit(ctx, res)
+
+
+@users_grp.command("update")
+@click.argument("user_ref")
+@click.option("--role", default=None)
+@click.option("--teams", default=None, help="Comma-separated team ids (replaces the set).")
+@click.option("--max-budget", type=float, default=None)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.pass_context
+def users_update(ctx, user_ref, role, teams, max_budget, rpm, tpm):
+    """POST /user/update. Given flags replace the field; omitted ones stay as-is."""
+    try:
+        body = users_mod.update_user(
+            user_id=user_ref if "@" not in user_ref else None,
+            email=user_ref if "@" in user_ref else None,
+            role=role,
+            teams=teams,
+            max_budget=max_budget,
+            rpm=rpm,
+            tpm=tpm,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/user/update", body):
+        return
+    _emit(ctx, _call(be.post, _conn(ctx), "/user/update", body))
+
+
+@users_grp.command("delete")
+@click.argument("user_ref")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def users_delete(ctx, user_ref, yes):
+    """POST /user/delete. Also invalidates every virtual key the user owns."""
+    c = _conn(ctx)
+    t = users_mod.resolve_user_target(_call(all_users, c), user_ref)
+    if not t:
+        extra = f" (several users share email {user_ref!r}: delete by user_id)" if "@" in user_ref else ""
+        raise click.ClickException(f"no live user matches {user_ref!r} — run `users list`{extra}")
+    body = {"user_id": t["user"].get("user_id")}
+    if _dry(ctx, "POST", "/user/delete", body):
+        return
+    keys = [_key_row(k) for k in _call(all_keys, c) if k.get("user_id") == t["user"].get("user_id")]
+    _confirm(ctx, yes, f"delete user {user_ref} and the {len(keys)} key(s) they own")
+    _call(be.post, c, "/user/delete", body)
+    _emit(
+        ctx,
+        {
+            "deleted": body,
+            "keys_removed": [{"alias": k.get("key_alias"), "token": k.get("token")} for k in keys],
+        },
+        lambda d: (
+            click.echo(f"deleted user {body['user_id']}"),
+            click.echo(
+                "keys no longer valid: "
+                + (", ".join(k["alias"] or k["token"] for k in d["keys_removed"]) or "(none)")
+            ),
+        ),
+    )
 
 
 # ── spend ───────────────────────────────────────────────────────────────────
