@@ -148,3 +148,116 @@ def test_target_ambiguous_email_is_refused_not_guessed():
 def test_target_unknown_or_empty_is_none():
     assert u.resolve_user_target([user(1)], "ghost") is None
     assert u.resolve_user_target([user(1)], "") is None
+
+
+# ── teams ─────────────────────────────────────────────────────────────────
+
+from cli_anything.litellm.core import teams as t
+
+
+def team(i, alias=None, members=1, blocked=None, teams_alias=None):
+    return {
+        "team_id": f"t-{i}",
+        "team_alias": teams_alias or alias or f"team-{i}",
+        "members_with_roles": [{"user_id": f"u{j}"} for j in range(members)],
+        "spend": 2.25,
+        "max_budget": 50,
+        "blocked": blocked,
+    }
+
+
+def test_team_normalize_names_the_human_fields():
+    row = t.normalize(team(1, members=2, teams_alias="eng"))
+    assert row == {
+        "team_id": "t-1",
+        "alias": "eng",
+        "members": 2,
+        "spend": 2.25,
+        "max_budget": 50,
+        "rpm_limit": None,
+        "tpm_limit": None,
+        "models": None,
+        "blocked": None,
+    }
+
+
+def test_new_team_minimal_pinned_id():
+    out = t.new_team("eng", "team-eng")
+    assert out == {"team_alias": "eng", "team_id": "team-eng"}
+
+
+def test_new_team_full_body_splits_models_and_members():
+    out = t.new_team(
+        "eng",
+        models="qwen, embed",
+        max_budget=50.0,
+        rpm=100,
+        tpm=20000,
+        budget_duration="30d",
+        members=("u1", "new@corp.io"),
+        member_role="admin",
+    )
+    assert out == {
+        "team_alias": "eng",
+        "models": ["qwen", "embed"],
+        "max_budget": 50.0,
+        "rpm_limit": 100,
+        "tpm_limit": 20000,
+        "budget_duration": "30d",
+        "members_with_roles": [
+            {"user_id": "u1", "team_member_role": "admin"},
+            {"user_email": "new@corp.io", "team_member_role": "admin"},
+        ],
+    }
+
+
+def test_new_team_requires_an_alias():
+    with pytest.raises(ValueError, match="--alias"):
+        t.new_team(None)
+
+
+def test_new_team_rejects_unknown_member_role_before_the_proxy():
+    with pytest.raises(ValueError, match="unknown --member-role 'owner'.*admin, user"):
+        t.new_team("eng", members=("u1",), member_role="owner")
+
+
+def test_update_team_targets_the_id_and_omits_unset():
+    out = t.update_team("t-1", alias="eng", models="qwen, embed", max_budget=20.0)
+    assert out == {"team_id": "t-1", "team_alias": "eng", "models": ["qwen", "embed"], "max_budget": 20.0}
+
+
+def test_update_team_requires_a_target_and_something_to_change():
+    with pytest.raises(ValueError, match="identify the team"):
+        t.update_team("")
+    with pytest.raises(ValueError, match="nothing to update"):
+        t.update_team("t-1")
+
+
+def test_member_entry_by_name_and_email():
+    assert t.member_entry("svc-bot") == {"user_id": "svc-bot"}
+    assert t.member_entry("svc@corp.io", "admin") == {"user_email": "svc@corp.io", "team_member_role": "admin"}
+    with pytest.raises(ValueError, match="user name or email"):
+        t.member_entry("")
+
+
+# ── resolve_team_target ───────────────────────────────────────────────────
+
+
+def test_team_target_resolved_by_id_preferring_the_exact_match():
+    # 't-1' is also a team_alias elsewhere, but an exact team_id wins.
+    res = t.resolve_team_target([team(1), team(2, teams_alias="t-1")], "t-1")
+    assert res["by"] == "team_id" and res["matches"] == ["t-1"] and res["team"]["team_id"] == "t-1"
+
+
+def test_team_target_resolved_by_unique_alias_names_the_team_id():
+    res = t.resolve_team_target([team(1), team(2)], "team-2")
+    assert res["by"] == "team_alias" and res["matches"] == ["t-2"] and res["team"]["team_id"] == "t-2"
+
+
+def test_team_target_ambiguous_alias_is_refused_not_guessed():
+    assert t.resolve_team_target([team(1, teams_alias="dup"), team(2, teams_alias="dup")], "dup") is None
+
+
+def test_team_target_unknown_or_empty_is_none():
+    assert t.resolve_team_target([team(1)], "ghost") is None
+    assert t.resolve_team_target([team(1)], "") is None

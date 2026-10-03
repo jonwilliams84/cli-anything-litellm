@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.4.0] — 2026-10-03
+
+Team management: the fourth leg of identity, next to models, users and keys.
+
+A team carries the budget, model access and rate limits that virtual keys
+inherit and that users join, but until now it could only be created or changed
+in the Admin UI. The `teams` group grows from read-only to full CRUD, all seven
+`/team/*` mutation endpoints:
+
+- **`teams create`** — POST `/team/new` with `--alias`, optional `--team-id`
+  (the id is what `keys generate --team` and `users create --teams` reference,
+  so pin it rather than let the proxy generate one), `--models`, `--max-budget`,
+  `--rpm`, `--tpm`, `--budget-duration` and repeatable `--member` whose role is
+  picked with `--member-role admin|user`. A member passed as an email gets a
+  proxy account created for it; member roles are validated client-side, like
+  user roles in 0.3.0. `--dry-run` prints the exact body.
+- **`teams update <team_id|alias>`** — POST `/team/update`; given flags replace
+  the field, omitted ones stay as-is. The argument is resolved against
+  `/team/list`: exact `team_id` first, then a *unique* `team_alias`; an alias
+  two teams share is refused, never guessed.
+- **`teams delete <team_id|alias>`** — POST `/team/delete`. Destructive: needs
+  `--yes` off a TTY. Deleting a team also deletes every virtual key minted for
+  it — exactly the `users delete` trap — so the command names the keys that stop
+  working (`keys_removed` in `--json`). Unknown ref → error pointing at
+  `teams list`.
+- **`teams member-add <team>` / `teams member-delete <team> --user`** — POST
+  `/team/member_add` and `/team/member_delete`. member-add checks a bare user
+  name against `users list` first (the endpoint 404s on an unknown user_id —
+  pass their email instead, which the proxy creates); member-delete sends
+  `user_id` or `user_email` per LiteLLM's request shape.
+- **`teams block` / `teams unblock <team>`** — POST `/team/block` and
+  `/team/unblock` (`{"team_ids": [id]}`). Blocking fails every key of the team,
+  reversibly; the block needs `--yes` off a TTY.
+- Core: `core/teams.py` (`new_team`, `update_team`, `normalize`,
+  `resolve_team_target`, `member_entry`), unit-tested in `tests/test_core.py`;
+  E2E and an onboard-team→team-key→delete-team workflow in
+  `tests/test_full_e2e.py`.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands
+  and the team-deletion trap they pair with.
+
 ## [0.3.0] — 2026-10-03
 
 User management: the third leg of identity, next to teams and keys.
