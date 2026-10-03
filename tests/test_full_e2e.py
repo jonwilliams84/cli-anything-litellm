@@ -308,3 +308,155 @@ def test_workflow_onboard_user_issue_key_then_delete_user():
     assert out["deleted"] == {"user_id": "svc-bot"} and out["keys_removed"] == [
         {"alias": "svc", "token": "sk-new"}
     ]
+
+
+# ── teams ─────────────────────────────────────────────────────────────────
+
+
+def proxy_team(tid, alias=None, members=(), blocked=None):
+    return {
+        "team_id": tid,
+        "team_alias": alias or tid,
+        "members_with_roles": [{"user_id": m} for m in members],
+        "spend": 0,
+        "blocked": blocked,
+    }
+
+
+def test_teams_create_dry_run_prints_body_sends_nothing():
+    post = mock.Mock()
+    r = run(["--dry-run", "teams", "create", "--alias", "eng", "--team-id", "team-eng", "--models", "qwen, embed",
+             "--max-budget", "50", "--member", "u1", "--member", "new@corp.io", "--member-role", "admin"], post=post)
+    assert json.loads(r.output)["body"] == {
+        "team_alias": "eng", "team_id": "team-eng", "models": ["qwen", "embed"], "max_budget": 50.0,
+        "members_with_roles": [{"user_id": "u1", "team_member_role": "admin"},
+                               {"user_email": "new@corp.io", "team_member_role": "admin"}],
+    }
+    post.assert_not_called()
+
+
+def test_teams_create_posts_and_reports_created():
+    post = mock.Mock(return_value={"team_id": "team-eng", "team_alias": "eng"})
+    r = run(["teams", "create", "--alias", "eng", "--tpm", "20000"], post=post)
+    post.assert_called_once_with(mock.ANY, "/team/new", {"team_alias": "eng", "tpm_limit": 20000})
+    assert '"created"' in r.output and "team-eng" in r.output
+
+
+def test_teams_create_rejects_unknown_member_role_before_the_proxy():
+    post = mock.Mock()
+    r = run(["teams", "create", "--alias", "eng", "--member-role", "owner"], post=post)
+    assert r.exit_code != 0 and "not one of 'admin', 'user'" in r.output
+    post.assert_not_called()
+
+
+def test_teams_update_resolves_alias_to_id_and_replaces_models():
+    post = mock.Mock(return_value={})
+    get = lambda c, p, **k: [proxy_team("t-1", "eng")] if p == "/team/list" else {}
+    r = run(["teams", "update", "eng", "--models", "qwen", "--max-budget", "20"], get=get, post=post)
+    assert post.call_args.args[1:] == ("/team/update", {"team_id": "t-1", "models": ["qwen"], "max_budget": 20.0})
+
+
+def test_teams_update_with_no_flags_is_a_clear_error():
+    r = run(["teams", "update", "eng"], get=lambda c, p, **k: [proxy_team("t-1", "eng")])
+    assert r.exit_code != 0 and "nothing to update" in r.output
+
+
+def test_teams_delete_resolves_alias_lists_invalidated_keys_and_needs_yes():
+    post = mock.Mock()
+    get = lambda c, p, **k: (
+        [proxy_team("t-1", "eng")] if p == "/team/list"
+        else {"keys": [{"token": "sk-t", "key_alias": "eng-bot", "team_id": "t-1"}], "total_pages": 1} if p == "/key/list" else {}
+    )
+    r = run(["teams", "delete", "eng"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output and post.assert_not_called() is None
+    r = run(["--json", "teams", "delete", "eng", "--yes"], get=get, post=post)
+    out = json.loads(r.output)
+    assert out["deleted"] == {"team_ids": ["t-1"]} and out["keys_removed"] == [{"alias": "eng-bot", "token": "sk-t"}]
+    assert post.call_args.args[1] == "/team/delete"
+
+
+def test_teams_delete_unknown_ref_is_an_error():
+    r = run(["teams", "delete", "ghost", "--yes"], get=lambda c, p, **k: [proxy_team("t-1")] if p == "/team/list" else {})
+    assert r.exit_code != 0 and "no live team matches 'ghost'" in r.output and "`teams list`" in r.output
+
+
+def test_teams_block_dry_run_sends_team_ids_and_block_needs_yes():
+    post = mock.Mock()
+    get = lambda c, p, **k: [proxy_team("t-1", "eng")] if p == "/team/list" else {}
+    r = run(["--dry-run", "teams", "block", "eng"], get=get, post=post)
+    assert json.loads(r.output)["body"] == {"team_ids": ["t-1"]}
+    post.assert_not_called()
+    r = run(["teams", "block", "eng"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output
+    post.assert_not_called()
+    r = run(["teams", "unblock", "eng", "--yes"], get=get, post=post)
+    assert post.call_args.args[1] == "/team/unblock"
+
+
+def test_teams_member_add_by_name_resolves_the_user_by_email():
+    get = lambda c, p, **k: (
+        [proxy_team("t-1", "eng")] if p == "/team/list"
+        else {"users": [proxy_user("svc-bot", email="svc@corp.io")], "total_pages": 1} if p == "/user/get_users" else {}
+    )
+    post = mock.Mock(return_value={})
+    r = run(["teams", "member-add", "eng", "--user", "svc@corp.io"], get=get, post=post)
+    assert post.call_args.args[1:] == ("/team/member_add", {"team_id": "t-1", "member": [{"user_email": "svc@corp.io"}]})
+
+
+def test_teams_member_add_unknown_bare_name_is_an_error():
+    get = lambda c, p, **k: [proxy_team("t-1", "eng")] if p == "/team/list" else {"users": [], "total_pages": 1}
+    post = mock.Mock()
+    r = run(["teams", "member-add", "eng", "--user", "nobody"], get=get, post=post)
+    assert r.exit_code != 0 and "no user matches 'nobody'" in r.output
+    post.assert_not_called()
+
+
+def test_teams_member_delete_body_uses_user_id_or_email():
+    get = lambda c, p, **k: [proxy_team("t-1", "eng")] if p == "/team/list" else {}
+    post = mock.Mock(return_value={})
+    r = run(["teams", "member-delete", "eng", "--user", "svc-bot"], get=get, post=post)
+    assert post.call_args.args[2] == {"team_id": "t-1", "user_id": "svc-bot"}
+    r = run(["teams", "member-delete", "eng", "--user", "svc@corp.io"], get=get, post=post)
+    assert post.call_args.args[2] == {"team_id": "t-1", "user_email": "svc@corp.io"}
+
+
+# ── workflow: team lifecycle feeding keys and users ───────────────────────
+
+
+def test_workflow_onboard_team_issue_team_key_then_delete_team():
+    """The team story end to end: create the team, mint a key for it, see both
+    in the read commands, then delete the team — and the key it owned is named."""
+    created = {"t": False, "k": False}
+    key = {"token": "sk-eng", "key_alias": "eng-bot", "team_id": "team-eng"}
+
+    def get(c, p, **k):
+        if p == "/team/list":
+            return [proxy_team("team-eng", "eng", members=("svc-bot",))] if created["t"] else []
+        if p == "/key/list":
+            return {"keys": [key] if created["k"] else [], "total_pages": 1}
+        return {}
+
+    def post(c, path, body=None, **k):
+        if path == "/team/new":
+            assert body["team_alias"] == "eng"
+            created["t"] = True
+            return {"team_id": "team-eng"}
+        if path == "/key/generate":
+            assert body.get("team_id") == "team-eng"
+            created["k"] = True
+            return {"key": "sk-eng"}
+        assert path == "/team/delete"
+        return {}
+
+    r = run(["teams", "create", "--alias", "eng", "--team-id", "team-eng", "--member", "svc-bot"], get=get, post=post)
+    assert '"created"' in r.output
+    r = run(["keys", "generate", "--alias", "eng-bot", "--team", "team-eng"], get=get, post=post)
+    assert "sk-eng" in r.output
+    r = run(["--json", "teams", "list"], get=get)
+    team_row = json.loads(r.output)[0]
+    assert team_row["team_id"] == "team-eng" and team_row["members"] == 1
+    r = run(["teams", "delete", "eng", "--yes"], get=get, post=post)
+    assert "deleted team team-eng" in r.output
+    r = run(["--json", "teams", "delete", "eng", "--yes"], get=get, post=post)
+    out = json.loads(r.output)
+    assert out["keys_removed"] == [{"alias": "eng-bot", "token": "sk-eng"}]

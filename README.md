@@ -3,7 +3,7 @@
 Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy from the shell.
 
 - **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails.
-- **Manage:** virtual keys (generate, update limits, block, rotate, delete), user accounts (create with role/team/budget, update, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), teams, spend.
+- **Manage:** virtual keys (generate, update limits, block, rotate, delete), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend.
 - **Audit:**
   - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
   - `fleet diff` compares proxies behind one VIP.
@@ -17,8 +17,9 @@ export LITELLM_URL=https://litellm.example LITELLM_API_KEY=sk-...
 cli-anything-litellm config test
 cli-anything-litellm models list
 cli-anything-litellm models add --name qwen --model hosted_vllm/qwen --api-base http://n1:8000/v1 --api-key os.environ/QWEN_KEY
+cli-anything-litellm teams create --alias eng --team-id team-eng --models qwen --max-budget 50 --member svc@corp.io
 cli-anything-litellm users create --user-id svc-bot --email svc@corp.io --teams eng --max-budget 5
-cli-anything-litellm keys generate --alias svc --user svc-bot --model qwen --rpm 60
+cli-anything-litellm keys generate --alias svc --user svc-bot --team team-eng --rpm 60
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000

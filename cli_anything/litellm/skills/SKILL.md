@@ -3,8 +3,9 @@ name: cli-anything-litellm
 description: >-
   Administer, tune and audit a LiteLLM proxy from the shell: model groups and
   replicas, live router settings, guardrails, virtual keys (create, limit,
-  block, rotate, delete), user accounts (create, update, delete), teams and
-  spend. Detects DRIFT between the config.yaml
+  block, rotate, delete), user accounts (create, update, delete), teams
+  (create, update, members, block, delete) and spend. Detects DRIFT between the
+  config.yaml
   in git and the running proxy (including models added through the Admin UI that
   exist only in its database), differences between proxies behind one VIP (the
   mismatched-master-key 401 class), and lints a config against built-in hygiene
@@ -48,15 +49,18 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A`, `keys delete A` |
 | Add a model **as a DB row** (what the Admin UI does) | `models add --name G --model hosted_vllm/qwen --api-base http://n1:8000/v1 --api-key os.environ/K [--mode chat] [--max-input-tokens N]` |
 | Remove a DB deployment (by id) or a whole group (by name) | `models delete <model|id>` (`drift` first — config-backed replicas come back on redeploy) |
-| Teams | `teams list`, `teams info <team_id>` |
+| Teams: list / inspect | `teams list`, `teams info <team_id>` |
+| Teams: create / change | `teams create --alias A --team-id T [--models m1,m2] [--max-budget 50] [--member U|--member E]`, `teams update <team_id|alias> --models m1,m2 [--max-budget N]` |
+| Teams: add / remove a member | `teams member-add <team_id|alias> --user U-or-E [--role admin|user]`, `teams member-delete <team_id|alias> --user U-or-E` |
+| Teams: stop / restore / remove | `teams block <team_id|alias> --yes`, `teams unblock <team_id|alias> --yes`, `teams delete <team_id|alias> --yes` (also deletes every key minted for the team) |
 | User accounts: list / inspect | `users list [--role R] [--team T]`, `users info <user_id|email>` (also lists the user's keys) |
 | User accounts: create | `users create --user-id U [--email E] [--role proxy_admin_viewer] [--teams a,b] [--max-budget 5]` — never mints a key; issue one with `keys generate --user U` |
 | User accounts: change / remove | `users update U --teams a,b [--role R] [--max-budget N]`, `users delete U --yes` (also invalidates every key the user owns — run `users info` first) |
 | Who is using it / what does it cost? | `spend --days 7 --by model|key|team|user` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
-nothing). `block`, `rotate`, `keys delete`, `models delete` and `users delete`
-need `--yes` when there is no TTY.
+nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
+`users delete`, `teams block`, `teams delete` need `--yes` when there is no TTY.
 
 ## Workflow for any change
 
@@ -93,6 +97,13 @@ need `--yes` when there is no TTY.
   (the alias is recorded in each log row); the master key shows as `(master key)`.
 - **`health` is not free.** It sends a completion to every deployment. On a
   metered upstream that costs money; on local vLLM it adds load.
+- **`teams delete` deletes every key minted for the team**, exactly like
+  `users delete` invalidates a user's keys — the confirmation names them, so
+  check `keys list --team <team_id>` before deleting. Blocking a team fails all
+  of its keys too, but reversibly. Delete matches an exact `team_id` first, then
+  a *unique* `team_alias`; an alias two teams share is refused (delete by id).
+  Pass `--member E` with an email and the proxy creates that account; member-add
+  by bare name is resolved against `users list` first (unknown name → error).
 - **`users create` never mints a key.** It sends `auto_create_key: false`, because
   an implicitly minted key has no alias and hides in audits. Keys are issued on
   purpose: `keys generate --alias svc --user svc-bot`. Conversely `users delete`

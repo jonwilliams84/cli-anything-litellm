@@ -21,6 +21,7 @@ from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import models as models_mod
+from cli_anything.litellm.core import teams as teams_mod
 from cli_anything.litellm.core import users as users_mod
 
 
@@ -674,42 +675,31 @@ def keys_rotate(ctx, key_or_alias, duration, yes):
 # ── teams ───────────────────────────────────────────────────────────────────
 
 
+TEAM_COLS = [
+    ("alias", "TEAM"),
+    ("team_id", "ID"),
+    ("members", "MEMBERS"),
+    ("spend", "SPEND"),
+    ("max_budget", "BUDGET"),
+    ("blocked", "BLOCKED"),
+]
+
+
 @cli.group("teams")
 def teams_grp():
     """Teams: members, budgets, model access."""
 
 
+def all_teams(conn) -> list[dict]:
+    """The live teams, as DELETE/UPDATE/BLOCK need them for id resolution."""
+    return be.get(conn, "/team/list") or []
+
+
 @teams_grp.command("list")
 @click.pass_context
 def teams_list(ctx):
-    res = _call(be.get, _conn(ctx), "/team/list") or []
-    rows = [
-        {
-            "team_id": t.get("team_id"),
-            "alias": t.get("team_alias"),
-            "members": len(t.get("members_with_roles") or []),
-            "spend": round(t.get("spend") or 0, 4),
-            "max_budget": t.get("max_budget"),
-            "models": t.get("models"),
-            "blocked": t.get("blocked"),
-        }
-        for t in res
-    ]
-    _emit(
-        ctx,
-        rows,
-        lambda r: _table(
-            r,
-            [
-                ("alias", "TEAM"),
-                ("team_id", "ID"),
-                ("members", "MEMBERS"),
-                ("spend", "SPEND"),
-                ("max_budget", "BUDGET"),
-                ("blocked", "BLOCKED"),
-            ],
-        ),
-    )
+    rows = [teams_mod.normalize(t) for t in _call(all_teams, _conn(ctx))]
+    _emit(ctx, rows, lambda r: _table(r, TEAM_COLS))
 
 
 @teams_grp.command("info")
@@ -717,6 +707,182 @@ def teams_list(ctx):
 @click.pass_context
 def teams_info(ctx, team_id):
     _emit(ctx, _call(be.get, _conn(ctx), "/team/info", params={"team_id": team_id}))
+
+
+def _resolve_team(conn, ref: str) -> dict[str, Any]:
+    """The live team record for `ref` (team_id or unique alias), or a Click error."""
+    t = teams_mod.resolve_team_target(_call(all_teams, conn), ref)
+    if not t:
+        raise click.ClickException(f"no live team matches {ref!r} — run `teams list`")
+    return t["team"]
+
+
+@teams_grp.command("create")
+@click.option("--alias", required=True, help="Team label shown in tables and in drift reports.")
+@click.option(
+    "--team-id", default=None, help="Id keys and users reference; the proxy generates one if omitted."
+)
+@click.option("--models", default=None, help="Comma-separated model groups the team may use; default all.")
+@click.option("--max-budget", type=float, default=None)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.option("--budget-duration", default=None, help="Budget reset cycle, e.g. 30d.")
+@click.option("--member", "members", multiple=True, help="User name or email to add; repeat for each.")
+@click.option(
+    "--member-role", default=None, type=click.Choice(["admin", "user"]), help="For the members above."
+)
+@click.pass_context
+def teams_create(ctx, alias, team_id, models, max_budget, rpm, tpm, budget_duration, members, member_role):
+    """POST /team/new. Members named by email get a proxy account created for them."""
+    try:
+        body = teams_mod.new_team(
+            alias,
+            team_id,
+            models=models,
+            max_budget=max_budget,
+            rpm=rpm,
+            tpm=tpm,
+            budget_duration=budget_duration,
+            members=members,
+            member_role=member_role,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/team/new", body):
+        return
+    res = _call(be.post, _conn(ctx), "/team/new", body)
+    if isinstance(res, dict):
+        res = {
+            "created": res.get("team_id") or team_id or alias,
+            "team_alias": res.get("team_alias") or alias,
+            **res,
+        }
+    _emit(ctx, res)
+
+
+@teams_grp.command("update")
+@click.argument("team_ref")
+@click.option("--alias", default=None)
+@click.option("--models", default=None, help="Comma-separated model groups (replaces the set).")
+@click.option("--max-budget", type=float, default=None)
+@click.option("--rpm", type=int, default=None)
+@click.option("--tpm", type=int, default=None)
+@click.option("--budget-duration", default=None)
+@click.pass_context
+def teams_update(ctx, team_ref, alias, models, max_budget, rpm, tpm, budget_duration):
+    """POST /team/update. Given flags replace the field; omitted ones stay as-is."""
+    t = _resolve_team(_conn(ctx), team_ref)
+    try:
+        body = teams_mod.update_team(
+            t["team_id"],
+            alias=alias,
+            models=models,
+            max_budget=max_budget,
+            rpm=rpm,
+            tpm=tpm,
+            budget_duration=budget_duration,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/team/update", body):
+        return
+    _emit(ctx, _call(be.post, _conn(ctx), "/team/update", body))
+
+
+@teams_grp.command("delete")
+@click.argument("team_ref")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def teams_delete(ctx, team_ref, yes):
+    """POST /team/delete. Also deletes every virtual key minted for the team."""
+    c = _conn(ctx)
+    t = _resolve_team(c, team_ref)
+    team_id = t["team_id"]
+    body = {"team_ids": [team_id]}
+    if _dry(ctx, "POST", "/team/delete", body):
+        return
+    keys = [_key_row(k) for k in _call(all_keys, c, team_id)]
+    _confirm(ctx, yes, f"delete team {team_ref} and the {len(keys)} key(s) minted for it")
+    _call(be.post, c, "/team/delete", body)
+    _emit(
+        ctx,
+        {
+            "deleted": body,
+            "keys_removed": [{"alias": k.get("key_alias"), "token": k.get("token")} for k in keys],
+        },
+        lambda d: (
+            click.echo(f"deleted team {team_id}"),
+            click.echo(
+                "keys no longer valid: "
+                + (", ".join(k["alias"] or k["token"] for k in d["keys_removed"]) or "(none)")
+            ),
+        ),
+    )
+
+
+@teams_grp.command("member-add")
+@click.argument("team_ref")
+@click.option("--user", required=True, help="User name or email; an email without an account is created.")
+@click.option(
+    "--role",
+    "role",
+    default=None,
+    type=click.Choice(["admin", "user"]),
+    help=f"Default: {teams_mod.DEFAULT_MEMBER_ROLE}.",
+)
+@click.pass_context
+def teams_member_add(ctx, team_ref, user, role):
+    """POST /team/member_add. The member starts inheriting the team's budget and models."""
+    c = _conn(ctx)
+    team_id = _resolve_team(c, team_ref)["team_id"]
+    if "@" not in user and not users_mod.resolve_user_target(_call(all_users, c), user):
+        raise click.ClickException(f"no user matches {user!r} — run `users list` (or pass their email)")
+    body = {"team_id": team_id, "member": [teams_mod.member_entry(user, role)]}
+    if _dry(ctx, "POST", "/team/member_add", body):
+        return
+    _emit(ctx, _call(be.post, c, "/team/member_add", body))
+
+
+@teams_grp.command("member-delete")
+@click.argument("team_ref")
+@click.option("--user", required=True, help="User name or email on the team.")
+@click.pass_context
+def teams_member_delete(ctx, team_ref, user):
+    """POST /team/member_delete. The user's own keys keep working; team keys stay with the team."""
+    c = _conn(ctx)
+    team_id = _resolve_team(c, team_ref)["team_id"]
+    body = (
+        {"team_id": team_id, "user_id": user} if "@" not in user else {"team_id": team_id, "user_email": user}
+    )
+    if _dry(ctx, "POST", "/team/member_delete", body):
+        return
+    _emit(ctx, _call(be.post, c, "/team/member_delete", body))
+
+
+def _simple_team_action(name: str, path: str, destructive: bool):
+    @teams_grp.command(name)
+    @click.argument("team_ref")
+    @click.option("--yes", is_flag=True)
+    @click.pass_context
+    def _cmd(ctx, team_ref, yes):
+        c = _conn(ctx)
+        team_id = _resolve_team(c, team_ref)["team_id"]
+        body = {"team_ids": [team_id]}
+        if _dry(ctx, "POST", path, body):
+            return
+        if destructive:
+            _confirm(ctx, yes, f"{name} team {team_ref}")
+        _emit(ctx, _call(be.post, c, path, body))
+
+    _cmd.__doc__ = {
+        "block": "Block a team (all of its keys error with 'Key blocked ...'); reversible with unblock.",
+        "unblock": "Unblock a team.",
+    }[name]
+    return _cmd
+
+
+_simple_team_action("block", "/team/block", True)
+_simple_team_action("unblock", "/team/unblock", False)
 
 
 # ── users ───────────────────────────────────────────────────────────────────
