@@ -355,3 +355,107 @@ def test_resolve_budget_target_is_an_exact_id_check():
 def test_budget_delete_body_uses_id_not_budget_id():
     # /budget/delete is the one endpoint of the family that says `id`.
     assert b.DELETE_KEY == "id"
+
+
+# ── customers ─────────────────────────────────────────────────────────────
+
+from cli_anything.litellm.core import customers as cu
+
+
+def customer(i, **kw):
+    return {
+        "user_id": f"cust-{i}",
+        "alias": kw.pop("alias", f"cust-{i}"),
+        "spend": 0.91234,
+        "max_budget": 20,
+        "budget_id": None,
+        "tpm_limit": 500,
+        "rpm_limit": 10,
+        "blocked": False,
+        **kw,
+    }
+
+
+def test_customers_as_rows_tolerates_list_and_envelopes():
+    rows = [customer(1)]
+    assert cu.as_rows(rows) == rows
+    assert cu.as_rows({"customers": rows}) == rows
+    assert cu.as_rows({"data": rows}) == rows
+    assert cu.as_rows({}) == [] and cu.as_rows(None) == []
+
+
+def test_customer_normalize_rounds_spend():
+    row = cu.normalize(customer(1))
+    assert row == {
+        "user_id": "cust-1",
+        "alias": "cust-1",
+        "spend": 0.9123,
+        "max_budget": 20,
+        "budget_id": None,
+        "tpm_limit": 500,
+        "rpm_limit": 10,
+        "blocked": False,
+    }
+
+
+def test_new_customer_minimal_needs_some_id():
+    assert cu.new_customer("cust-x") == {"user_id": "cust-x"}
+    assert cu.new_customer(alias="acme") == {"alias": "acme"}
+
+
+def test_new_customer_full_body():
+    out = cu.new_customer("cust-x", alias="acme", max_budget=20.0, budget_id="bud-1", rpm=10, tpm=500)
+    assert out == {
+        "user_id": "cust-x",
+        "alias": "acme",
+        "max_budget": 20.0,
+        "budget_id": "bud-1",
+        "rpm_limit": 10,
+        "tpm_limit": 500,
+    }
+
+
+def test_new_customer_refuses_an_id_nobody_knows():
+    # The proxy generates a user_id when both are missing — an unnamed end
+    # user is an audit dead end, exactly like an implicitly minted key.
+    with pytest.raises(ValueError, match="--user-id.*--alias|--alias.*--user-id"):
+        cu.new_customer()
+
+
+def test_update_customer_targets_the_id_and_omits_unset():
+    assert cu.update_customer("cust-x", max_budget=30.0) == {"user_id": "cust-x", "max_budget": 30.0}
+
+
+def test_update_customer_requires_a_target_and_something_to_change():
+    with pytest.raises(ValueError, match="identify the customer"):
+        cu.update_customer("", max_budget=1)
+    with pytest.raises(ValueError, match="nothing to update"):
+        cu.update_customer("cust-x")
+
+
+def test_ids_body_speaks_plural():
+    assert cu.ids_body(["cust-1"]) == {"user_ids": ["cust-1"]}
+    assert cu.ids_body("cust-1") == {"user_ids": ["cust-1"]}
+    assert cu.DELETE_KEY == "user_ids"
+    with pytest.raises(ValueError, match="no customer"):
+        cu.ids_body([])
+
+
+def test_customer_target_resolved_by_user_id_preferring_the_exact_match():
+    # 'cust-1' is also another customer's alias, but an exact user_id wins.
+    res = cu.resolve_customer_target([customer(1), customer(2, alias="cust-1")], "cust-1")
+    assert res["by"] == "user_id" and res["matches"] == ["cust-1"] and res["customer"]["user_id"] == "cust-1"
+
+
+def test_customer_target_resolved_by_unique_alias_names_the_user_id():
+    res = cu.resolve_customer_target([customer(1, alias="acme"), customer(2, alias="acme-2")], "acme-2")
+    assert res["by"] == "alias" and res["matches"] == ["cust-2"]
+
+
+def test_customer_target_ambiguous_alias_is_refused_not_guessed():
+    assert cu.resolve_customer_target([customer(1, alias="acme"), customer(2, alias="acme")], "acme") is None
+
+
+def test_customer_target_unknown_or_empty_is_none():
+    assert cu.resolve_customer_target([customer(1)], "ghost") is None
+    assert cu.resolve_customer_target([customer(1)], "") is None

@@ -637,3 +637,199 @@ def test_workflow_budget_create_attach_reprice_delete():
 
     r = run(["budgets", "delete", "eng-2026", "--yes"], get=get, post=post)
     assert r.exit_code == 0 and state["rows"] == []
+
+
+
+
+# ── customers ─────────────────────────────────────────────────────────────
+
+
+def proxy_customer(i="1", **kw):
+    return {
+        "user_id": f"cust-{i}",
+        "alias": f"cust-{i}",
+        "spend": 0.91234,
+        "max_budget": 20,
+        "budget_id": None,
+        "tpm_limit": 500,
+        "rpm_limit": 10,
+        "blocked": False,
+        **kw,
+    }
+
+
+def cust_state(rows, envelope=False):
+    """Stub /customer/list (both response shapes) and /customer/info."""
+    state = {"rows": list(rows)}
+
+    def get(c, p, **k):
+        if p == "/customer/list":
+            if envelope:
+                return {"customers": state["rows"], "total_pages": 1, "page": 1}
+            return state["rows"]  # older proxies return a bare list
+        if p == "/customer/info":
+            hit = next(
+                (r for r in state["rows"] if r.get("user_id") == (k.get("params") or {}).get("user_id")), {}
+            )
+            return dict(hit)
+        return {}
+
+    return state, get
+
+
+def test_customers_list_json_shapes_and_table():
+    state, get = cust_state([proxy_customer(1), proxy_customer(2, max_budget=5.0)])
+    r = run(["--json", "customers", "list"], get=get)
+    rows = json.loads(r.output)
+    assert [row["user_id"] for row in rows] == ["cust-1", "cust-2"] and rows[1]["max_budget"] == 5.0
+    r = run(["customers", "list"], get=get)
+    assert "USER_ID" in r.output and "BUDGET" in r.output
+    post = mock.Mock(return_value={})  # a read; posts must stay absent
+    r = run(["customers", "list"], get=get, post=post)
+    post.assert_not_called()
+
+
+def test_customers_list_tolerates_the_paginated_envelope():
+    state, get = cust_state([proxy_customer(1)], envelope=True)
+    r = run(["--json", "customers", "list"], get=get)
+    assert [row["user_id"] for row in json.loads(r.output)] == ["cust-1"]
+
+
+def test_customers_list_follows_pagination():
+    def get(c, p, **k):
+        if p == "/customer/list":
+            if k["params"]["page"] == 1:
+                return {"customers": [proxy_customer(1)], "total_pages": 2}
+            return {"customers": [proxy_customer(2)], "total_pages": 2}
+        return {}
+
+    r = run(["--json", "customers", "list"], get=get)
+    assert [row["user_id"] for row in json.loads(r.output)] == ["cust-1", "cust-2"]
+
+
+def test_customers_list_filter_by_budget():
+    state, get = cust_state([proxy_customer(1), proxy_customer(2, budget_id="eng-2026")])
+    r = run(["--json", "customers", "list", "--budget", "eng-2026"], get=get)
+    assert [row["user_id"] for row in json.loads(r.output)] == ["cust-2"]
+
+
+def test_customers_info_resolves_an_alias_to_the_user_id():
+    state, get = cust_state([proxy_customer(1, alias="acme")])
+    r = run(["customers", "info", "acme"], get=get)
+    assert "acme" in r.output and "cust-1" in r.output
+
+
+def test_customers_create_dry_run_prints_body_sends_nothing():
+    post = mock.Mock()
+    r = run(
+        ["--dry-run", "customers", "create", "--user-id", "cust-x", "--alias", "acme",
+         "--max-budget", "20", "--budget-id", "eng-2026", "--rpm", "10"],
+        post=post,
+    )
+    assert json.loads(r.output)["body"] == {
+        "user_id": "cust-x", "alias": "acme", "max_budget": 20.0,
+        "budget_id": "eng-2026", "rpm_limit": 10,
+    }
+    assert "POST /customer/new" in r.output
+    post.assert_not_called()
+
+
+def test_customers_create_needs_a_user_id_or_alias():
+    post = mock.Mock()
+    r = run(["customers", "create", "--max-budget", "20"], post=post)
+    assert r.exit_code != 0 and "--user-id" in r.output and "--alias" in r.output
+    post.assert_not_called()
+
+
+def test_customers_create_posts_the_body():
+    post = mock.Mock(return_value={"user_id": "cust-x"})
+    r = run(["customers", "create", "--user-id", "cust-x", "--max-budget", "20"], post=post)
+    post.assert_called_once_with(mock.ANY, "/customer/new", {"user_id": "cust-x", "max_budget": 20.0})
+    assert "created cust-x" in r.output
+
+
+def test_customers_update_unknown_ref_is_an_error_before_the_proxy():
+    post = mock.Mock()
+    state, get = cust_state([proxy_customer(1)])
+    r = run(["customers", "update", "ghost", "--max-budget", "2"], get=get, post=post)
+    assert r.exit_code != 0 and "no live customer matches 'ghost'" in r.output and "`customers list`" in r.output
+    post.assert_not_called()
+
+
+def test_customers_update_resolves_alias_and_omits_unset_fields():
+    post = mock.Mock(return_value={"user_id": "cust-1"})
+    state, get = cust_state([proxy_customer(1, alias="acme")])
+    r = run(["customers", "update", "acme", "--max-budget", "30"], get=get, post=post)
+    post.assert_called_once_with(mock.ANY, "/customer/update", {"user_id": "cust-1", "max_budget": 30.0})
+    assert r.exit_code == 0
+    post = mock.Mock()
+    r = run(["customers", "update", "acme"], get=get, post=post)
+    assert r.exit_code != 0 and "nothing to update" in r.output
+    post.assert_not_called()
+
+
+def test_customers_block_unblock_resolve_speak_plural_and_block_needs_yes():
+    state, get = cust_state([proxy_customer(1, alias="acme")])
+    r = run(["--dry-run", "customers", "block", "acme"], get=get)
+    assert json.loads(r.output)["body"] == {"user_ids": ["cust-1"]}
+    post = mock.Mock()
+    r = run(["customers", "block", "acme"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output
+    post.assert_not_called()
+    post = mock.Mock(return_value={"blocked": ["cust-1"]})
+    r = run(["customers", "unblock", "acme"], get=get, post=post)  # unblock is not destructive
+    assert post.call_args.args[1:] == ("/customer/unblock", {"user_ids": ["cust-1"]})
+    r = run(["customers", "block", "acme", "--yes"], get=get, post=post)
+    post.assert_called_with(mock.ANY, "/customer/block", {"user_ids": ["cust-1"]})
+
+
+def test_customers_delete_dry_run_uses_user_ids_and_gates_on_yes():
+    state, get = cust_state([proxy_customer(1)])
+    r = run(["--dry-run", "customers", "delete", "cust-1"], get=get)
+    assert json.loads(r.output)["body"] == {"user_ids": ["cust-1"]}  # the family's plural outlier
+    post = mock.Mock()
+    r = run(["customers", "delete", "cust-1"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output
+    post.assert_not_called()
+    post = mock.Mock(return_value={})
+    r = run(["customers", "delete", "cust-1", "--yes"], get=get, post=post)
+    post.assert_called_once_with(mock.ANY, "/customer/delete", {"user_ids": ["cust-1"]})
+    assert '"deleted"' in r.output
+
+
+def test_workflow_budget_capped_customer_blocked_then_deleted():
+    """The end-user story: a customer onboarded onto a shared budget, blocked
+    when it is abused, unblocked, then removed."""
+    state, get = cust_state([], envelope=True)
+
+    def post(c, path, body=None, **k):
+        if path == "/customer/new":
+            state["rows"].append(dict(body, spend=0, blocked=False))
+            return dict(body)
+        if path in ("/customer/block", "/customer/unblock"):
+            for r_ in state["rows"]:
+                if r_.get("user_id") in body["user_ids"]:
+                    r_["blocked"] = path == "/customer/block"
+            return {"blocked": body["user_ids"]}
+        assert path == "/customer/delete", path
+        state["rows"] = [r_ for r_ in state["rows"] if r_.get("user_id") not in body["user_ids"]]
+        return {}
+
+    r = run(["customers", "create", "--user-id", "cust-x", "--alias", "acme", "--budget-id", "eng-2026"], get=get, post=post)
+    assert "created cust-x" in r.output
+
+    r = run(["--json", "customers", "list", "--budget", "eng-2026"], get=get)
+    rows = json.loads(r.output)
+    assert [row["user_id"] for row in rows] == ["cust-x"] and rows[0]["budget_id"] == "eng-2026"
+
+    r = run(["customers", "block", "acme", "--yes"], get=get, post=post)
+    assert r.exit_code == 0
+    r = run(["--json", "customers", "info", "acme"], get=get)
+    assert json.loads(r.output)["blocked"] is True
+    r = run(["customers", "unblock", "acme"], get=get, post=post)
+    assert r.exit_code == 0
+    r = run(["--json", "customers", "info", "acme"], get=get)
+    assert json.loads(r.output)["blocked"] is False
+
+    r = run(["customers", "delete", "cust-x", "--yes"], get=get, post=post)
+    assert r.exit_code == 0 and state["rows"] == []

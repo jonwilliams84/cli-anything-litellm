@@ -5,7 +5,9 @@ description: >-
   replicas, live router settings, guardrails, virtual keys (create, limit,
   block, rotate, delete), user accounts (create, update, delete), teams
   (create, update, members, block, delete), budgets (reusable spend caps keys
-  reference by budget_id: create, update, delete) and spend. Detects DRIFT between
+  reference by budget_id: create, update, delete), customers (end users of the
+  app behind the proxy: track and cap by user_id, block, delete) and spend.
+  Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
   exist only in its database), differences between proxies behind one VIP (the
@@ -50,6 +52,9 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A` (carries `budget_id` over), `keys delete A` |
 | Budgets: list / inspect | `budgets list`, `budgets info <budget_id>` (also names every key and team on it) |
 | Budgets: create / re-price / remove | `budgets create --budget-id B --max-budget 100 --duration 30d [--soft-budget 90] [--parallel 5] [--model-max-budget '{"gpt-4o": 0.01}']`, `budgets update B --max-budget 200` (hit every attached key, team and user at once), `budgets delete B --yes` (attached keys/teams keep working on their own limits) |
+| Customers (end users): list / inspect | `customers list [--budget B]`, `customers info <user_id|alias>` |
+| Customers: create / change | `customers create --user-id U [--alias A] [--max-budget N] [--budget-id B] [--rpm N] [--tpm N]`, `customers update <user_id|alias> [--max-budget N] [--budget-id B]` |
+| Customers: stop / restore / remove | `customers block <user_id|alias> --yes`, `customers unblock <user_id|alias>`, `customers delete <user_id|alias> --yes` (stops spend attribution for the end user; deletes no key) |
 | Add a model **as a DB row** (what the Admin UI does) | `models add --name G --model hosted_vllm/qwen --api-base http://n1:8000/v1 --api-key os.environ/K [--mode chat] [--max-input-tokens N]` |
 | Remove a DB deployment (by id) or a whole group (by name) | `models delete <model|id>` (`drift` first — config-backed replicas come back on redeploy) |
 | Teams: list / inspect | `teams list`, `teams info <team_id>` |
@@ -63,7 +68,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
-`users delete`, `teams block`, `teams delete`, `budgets delete` need `--yes`
+`users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete` need `--yes`
 when there is no TTY.
 
 ## Workflow for any change
@@ -124,6 +129,13 @@ when there is no TTY.
   not say `budget_id`. Deleting a budget detaches its keys, teams and users;
   they keep working under their own inline limits. A `budgets create` with
   nothing to cap is refused before the proxy is called.
+- **Customers are the app's end users**, identified by the `user_id` the app
+  passes with every request; spend is attributed to them live and capped by
+  their inline `max_budget` or a shared `budget_id`. The mutating endpoints of
+  the family (block / unblock / delete) all take `{"user_ids": [...]}`. Delete
+  stops spend attribution for that end user — it deletes no key. A
+  `customers create` without a user id or an alias is refused client-side: the
+  proxy would generate an id nobody can find later.
 - **Placeholder credentials** (`api_key: none`) are reported by `lint` as
   `info`, not as leaked secrets: they mean the backend takes no key at all, which
   is worth a deliberate decision.
