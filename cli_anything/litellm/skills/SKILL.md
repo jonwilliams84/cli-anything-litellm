@@ -6,7 +6,9 @@ description: >-
   block, rotate, delete), user accounts (create, update, delete), teams
   (create, update, members, block, delete), budgets (reusable spend caps keys
   reference by budget_id: create, update, delete), customers (end users of the
-  app behind the proxy: track and cap by user_id, block, delete) and spend.
+  app behind the proxy: track and cap by user_id, block, delete), per-request
+  logs from the spend log (who called what, at what spend/latency, filterable
+  by key/user/team/model) and spend.
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
@@ -65,6 +67,8 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | User accounts: create | `users create --user-id U [--email E] [--role proxy_admin_viewer] [--teams a,b] [--max-budget 5]` — never mints a key; issue one with `keys generate --user U` |
 | User accounts: change / remove | `users update U --teams a,b [--role R] [--max-budget N]`, `users delete U --yes` (also invalidates every key the user owns — run `users info` first) |
 | Who is using it / what does it cost? | `spend --days 7 --by model|key|team|user` |
+| Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
+| Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M] [--days 7]` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
@@ -101,9 +105,15 @@ when there is no TTY.
   proxy). `keys rotate` does the equivalent in three open-source calls: rename the
   old key, generate a replacement with the same alias/team/models/limits, delete
   the old one. The old secret stops working at the last step.
-- **Spend logs are written asynchronously.** Right after traffic, `spend` can be
-  short; wait a few seconds. Deleted keys are still named in `spend --by key`
-  (the alias is recorded in each log row); the master key shows as `(master key)`.
+- **Spend logs are written asynchronously.** Right after traffic, `spend`,
+  `logs list` and `logs summary` can be short; wait a few seconds. Deleted keys
+  are still named in `spend --by key` (the alias is recorded in each log row);
+  the master key shows as `(master key)`. `logs list --key` takes an alias, an
+  `sk-...` key (hashed before matching — the log stores sha256, never the secret)
+  or a hashed token; the row's own `api_key` is that hash and is never echoed —
+  callers are named from the live key list or the alias recorded at request time
+  (`svc (gone)` for renamed, rotated or deleted keys). The window filter is
+  server-side (`--days`); key/user/team/model filters are applied client-side.
 - **`health` is not free.** It sends a completion to every deployment. On a
   metered upstream that costs money; on local vLLM it adds load.
 - **`teams delete` deletes every key minted for the team**, exactly like

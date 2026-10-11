@@ -833,3 +833,132 @@ def test_workflow_budget_capped_customer_blocked_then_deleted():
 
     r = run(["customers", "delete", "cust-x", "--yes"], get=get, post=post)
     assert r.exit_code == 0 and state["rows"] == []
+
+
+# ── logs list / logs summary ──────────────────────────────────────────────
+
+import hashlib
+
+SVC_TOKEN, OTHER_TOKEN = "b" * 64, "c" * 64
+MASTER_HASH = hashlib.sha256(b"sk-master").hexdigest()
+
+
+def log_row(i, **kw):
+    """A /spend/logs row, as the proxy writes it (sha256 key, ISO timestamps)."""
+    row = {
+        "request_id": f"req-{i}",
+        "call_type": "/chat/completion",
+        "model": "bedrock/qwen-2.5",
+        "model_group": "qwen",
+        "api_key": SVC_TOKEN,
+        "user": "svc-bot",
+        "team_id": "eng",
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "spend": 0.0005,
+        "startTime": f"2026-10-11T00:0{i}:00",
+        "endTime": f"2026-10-11T00:0{i}:02",
+        "cache_hit": False,
+        "metadata": {"user_api_key_alias": "svc"},
+    }
+    row.update(kw)
+    return row
+
+
+def log_proxy(rows):
+    def get(c, p, **k):
+        if p == "/spend/logs":
+            return rows
+        if p == "/key/list":
+            return {"keys": [{"key_alias": "svc", "token": SVC_TOKEN}, {"key_alias": "web", "token": OTHER_TOKEN}], "total_pages": 1}
+        return {}
+
+    return get
+
+
+def test_logs_list_rows_newest_first_with_named_caller():
+    r = run(["--json", "logs", "list", "--days", "2"], get=log_proxy([log_row(2), log_row(1)]))
+    d = json.loads(r.output)
+    assert d["matched"] == 2 and d["window_days"] == 2
+    assert [row["request_id"] for row in d["rows"]] == ["req-2", "req-1"]
+    assert d["rows"][0]["caller"] == "svc" and SVC_TOKEN not in r.output
+    assert d["rows"][0]["spend"] == 0.0005 and d["rows"][0]["latency_ms"] == 2000.0
+
+
+def test_logs_list_names_the_master_key_and_later_gone_keys():
+    r = run(
+        ["--json", "logs", "list"],
+        get=log_proxy([log_row(1, api_key=MASTER_HASH), log_row(2, api_key="f" * 64, metadata={"user_api_key_alias": "old-svc"})]),
+    )
+    callers = {row["caller"] for row in json.loads(r.output)["rows"]}
+    assert callers == {"(master key)", "old-svc (gone)"}
+
+
+def test_logs_list_filters_by_alias_user_team_model():
+    rows = [
+        log_row(1),
+        log_row(2, user="web-end", model_group="embed", model="embed", api_key=OTHER_TOKEN, team_id=None),
+        log_row(3, model_group="embed", model="embed", api_key=OTHER_TOKEN, team_id="ops"),
+    ]
+
+    def get(c, p, **k):
+        if p == "/spend/logs":
+            return rows
+        if p == "/key/list":
+            return {"keys": [{"key_alias": "svc", "token": SVC_TOKEN}, {"key_alias": "web", "token": OTHER_TOKEN}], "total_pages": 1}
+        return {}
+
+    d = json.loads(run(["--json", "logs", "list", "--key", "svc"], get=get).output)
+    assert [row["request_id"] for row in d["rows"]] == ["req-1"] and d["filters"]["key"] == "svc"
+    assert json.loads(run(["--json", "logs", "list", "--user", "web-end"], get=get).output)["matched"] == 1
+    assert json.loads(run(["--json", "logs", "list", "--team", "ops"], get=get).output)["matched"] == 1
+    d = json.loads(run(["--json", "logs", "list", "--model", "embed", "--limit", "1"], get=get).output)
+    assert d["matched"] == 2 and len(d["rows"]) == 1 and d["rows"][0]["request_id"] == "req-3"
+
+
+def test_logs_list_refuses_ambiguous_alias_before_the_proxy():
+    saw_logs = []
+
+    def get(c, p, **k):
+        if p == "/spend/logs":
+            saw_logs.append(True)
+            return [log_row(1)]
+        if p == "/key/list":
+            return {"keys": [{"key_alias": "svc", "token": SVC_TOKEN}, {"key_alias": "svc", "token": OTHER_TOKEN}], "total_pages": 1}
+        return {}
+
+    r = run(["--json", "logs", "list", "--key", "svc"], get=get)
+    assert r.exit_code != 0 and "matches 2 keys" in r.output and not saw_logs
+
+
+def test_logs_summary_totals_and_human_output():
+    rows = [
+        log_row(1, spend=0.5),
+        log_row(2, spend=0.5, completion_tokens=0),
+        log_row(3, spend=0.2, model_group="embed", model="embed", startTime="2026-10-11T05:00:00", endTime="2026-10-11T05:00:04"),
+        log_row(4, spend=0.0, cache_hit=True),
+    ]
+    r = run(["--json", "logs", "summary"], get=log_proxy(rows))
+    s = json.loads(r.output)
+    assert s["requests"] == 4 and s["spend"] == 1.2 and s["cache_hits"] == 1
+    assert s["latency_ms"]["p50"] == 2000.0 and s["latency_ms"]["p95"] == 4000.0 and s["latency_ms"]["max"] == 4000.0
+    assert s["models"][0]["model"] == "qwen" and s["models"][0]["latency_ms"]["p50"] == 2000.0
+    assert s["models"][1]["model"] == "embed" and s["models"][1]["latency_ms"]["p50"] == 4000.0
+
+    r = run(["logs", "summary"], get=log_proxy(rows))
+    assert "4 request(s) in the last 7 day(s): $1.2 · cache 1 hit(s)" in r.output
+    assert "p50/p95/max: 2000.0ms / 4000.0ms / 4000.0ms" in r.output
+
+
+def test_workflow_spend_total_then_logs_drill_down_per_key():
+    """`spend --by key` shows a key burning budget; `logs list --key` names the
+    requests behind that number — same log, drill-down view."""
+    rows = [log_row(1, spend=0.5), log_row(2, spend=0.5), log_row(3, spend=9.0, api_key=OTHER_TOKEN)]
+
+    r = run(["--json", "spend", "--by", "key"], get=log_proxy(rows))
+    per_key = {row["key"]: row["spend"] for row in json.loads(r.output)["rows"]}
+    assert per_key["svc"] == 1.0 and per_key["web"] == 9.0
+
+    d = json.loads(run(["--json", "logs", "list", "--key", "svc"], get=log_proxy(rows)).output)
+    assert d["matched"] == 2
+    assert {row["request_id"] for row in d["rows"]} == {"req-1", "req-2"}

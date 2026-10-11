@@ -22,6 +22,7 @@ from cli_anything.litellm.core import budgets as budgets_mod
 from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
+from cli_anything.litellm.core import logs as logs_mod
 from cli_anything.litellm.core import models as models_mod
 from cli_anything.litellm.core import teams as teams_mod
 from cli_anything.litellm.core import users as users_mod
@@ -1386,6 +1387,153 @@ def users_delete(ctx, user_ref, yes):
     )
 
 
+# ── logs ────────────────────────────────────────────────────────────────────
+
+
+LOG_COLS = [
+    ("when", "WHEN"),
+    ("model", "MODEL"),
+    ("caller", "CALLER"),
+    ("user", "USER"),
+    ("call_type", "CALL"),
+    ("total_tokens", "TOKENS"),
+    ("spend", "SPEND"),
+    ("latency_ms", "LATENCY(ms)"),
+    ("cache_hit", "CACHE"),
+]
+
+SUMMARY_COLS = [
+    ("model", "MODEL"),
+    ("requests", "REQUESTS"),
+    ("spend", "SPEND"),
+    ("prompt_tokens", "PROMPT"),
+    ("completion_tokens", "COMPLETION"),
+    ("latency_ms", "LATENCY p50/p95(ms)"),
+]
+
+
+def _fetch_logs(conn, days: int) -> list[dict[str, Any]]:
+    """The proxy's spend log over the last ``days`` days (the window `spend` uses)."""
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=days + 1)
+    logs = _call(
+        be.get,
+        conn,
+        "/spend/logs",
+        params={"start_date": start.isoformat(), "end_date": end.isoformat(), "summarize": "false"},
+    )
+    return logs if isinstance(logs, list) else []
+
+
+def _aliases(conn) -> dict[str, str]:
+    return logs_mod.key_alias_map(_call(all_keys, conn), conn.get("key"))
+
+
+def _log_filters(key, user, team, model) -> dict[str, str]:
+    """The active filters, for the output header."""
+    return {k: v for k, v in {"key": key, "user": user, "team": team, "model": model}.items() if v}
+
+
+@cli.group("logs")
+def logs_grp():
+    """Recent requests from the spend log: who called what, tokens, spend, latency."""
+
+
+@logs_grp.command("list")
+@click.option("--key", default=None, help="Key sk-…, hashed token, or alias (`keys list` names them).")
+@click.option("--user", default=None, help="end-user / user_id the request carried.")
+@click.option("--team", default=None, help="team_id the calling key belongs to.")
+@click.option("--model", default=None, help="Model group.")
+@click.option("--days", default=7, type=int, help="Window in days (the log is written async).")
+@click.option("--limit", default=25, type=int, help="Newest N requests to show after filtering.")
+@click.pass_context
+def logs_list(ctx, key, user, team, model, days, limit):
+    """One row per request, newest first — the drill-down behind `spend` totals.
+
+    Logs are written asynchronously: right after traffic nothing is there yet.
+    """
+    c = _conn(ctx)
+    token = None
+    if key:
+        try:
+            token = logs_mod.token_of(key, _call(all_keys, c))
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+    rows = logs_mod.filter_logs(_call(_fetch_logs, c, days), key=token, user=user, team=team, model=model)
+    aliases = _aliases(c)
+    matched = len(rows)
+    rows = [logs_mod.normalize(r, aliases) for r in rows]
+    rows.sort(key=lambda r: r["when"] or "", reverse=True)
+    rows = rows[: max(limit, 0)]
+    data = {
+        "window_days": days,
+        "filters": _log_filters(key, user, team, model),
+        "matched": matched,
+        "rows": rows,
+    }
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo(
+                f"{d['matched']} request(s) in the last {d['window_days']} day(s)"
+                + (f", {', '.join(f'{k} {v}' for k, v in d['filters'].items())}" if d["filters"] else "")
+                + f" — newest {len(d['rows'])} shown"
+            ),
+            _table(d["rows"], LOG_COLS),
+        ),
+    )
+
+
+@logs_grp.command("summary")
+@click.option("--key", default=None, help="Key sk-…, hashed token, or alias.")
+@click.option("--user", default=None, help="end-user / user_id the request carried.")
+@click.option("--team", default=None, help="team_id the calling key belongs to.")
+@click.option("--model", default=None, help="Model group.")
+@click.option("--days", default=7, type=int, help="Window in days (the log is written async).")
+@click.pass_context
+def logs_summary(ctx, key, user, team, model, days):
+    """Traffic and latency over the window: totals, p50/p95, per-model breakdown.
+
+    `spend` is the money view (grouped by who to bill); this is the traffic
+    view over the same log — what share of requests each model takes, whether
+    a latency tail is forming, how often the cache answered.
+    """
+    c = _conn(ctx)
+    token = None
+    if key:
+        try:
+            token = logs_mod.token_of(key, _call(all_keys, c))
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+    res = logs_mod.summary(
+        logs_mod.filter_logs(_call(_fetch_logs, c, days), key=token, user=user, team=team, model=model)
+    )
+    res["window_days"] = days
+    res["filters"] = _log_filters(key, user, team, model)
+    _emit(
+        ctx,
+        res,
+        lambda r: (
+            click.echo(
+                f"{r['requests']} request(s) in the last {r['window_days']} day(s): "
+                f"${r['spend']} · cache {r['cache_hits']} hit(s)"
+            ),
+            click.echo(
+                "latency p50/p95/max: "
+                + " / ".join(f"{v}ms" if v is not None else "-" for v in r["latency_ms"].values())
+            ),
+            _table(
+                [
+                    {**m, **{"latency_ms": f"{m['latency_ms']['p50']}/{m['latency_ms']['p95']}"}}
+                    for m in r["models"]
+                ],
+                SUMMARY_COLS,
+            ),
+        ),
+    )
+
+
 # ── spend ───────────────────────────────────────────────────────────────────
 
 
@@ -1396,17 +1544,7 @@ def users_delete(ctx, user_ref, yes):
 def spend(ctx, days, group_by):
     """Spend and request totals over the last N days, grouped client-side from /spend/logs."""
     c = _conn(ctx)
-    end = date.today() + timedelta(days=1)
-    start = end - timedelta(days=days + 1)
-    logs = (
-        _call(
-            be.get,
-            c,
-            "/spend/logs",
-            params={"start_date": start.isoformat(), "end_date": end.isoformat(), "summarize": "false"},
-        )
-        or []
-    )
+    logs = _call(_fetch_logs, c, days)
     field = {"model": "model_group", "key": "api_key", "team": "team_id", "user": "user"}[group_by]
     agg: dict[str, dict[str, Any]] = {}
     alias: dict[str, str] = {}

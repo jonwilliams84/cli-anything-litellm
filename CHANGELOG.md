@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.7.0] — 2026-10-11
+
+Request logs: per-request observability from the spend log the CLI already
+read for `spend` totals — the drill-down from "this key spent $9" to *which
+requests* and *how slow*.
+
+A LiteLLM proxy records every completion it serves in its spend log:
+`request_id`, call type, model group, the (hashed) key that paid, the end
+user and team, token counts, spend, cache hit, and timestamps. Until now the
+CLI reduced all of that to aggregate totals per entity — there was no way to
+see an individual request, whether a latency tail was forming, or what a
+given key actually did. The new `logs` group exposes those rows directly:
+
+- **`logs list`** — GET `/spend/logs` over the same `--days` window `spend`
+  uses (default 7; the log is written asynchronously, so fresh traffic shows
+  up late), one row per request, newest first (`--limit`, default 25):
+  timestamp, model, caller, user, call type, tokens, spend, latency, cache
+  hit. Filters: `--key` (an `sk-…` key is hashed before matching — the log
+  stores sha256, never the secret), a hashed token, or an alias resolved
+  against `keys list`; plus `--user`, `--team` and `--model`. The key/user/
+  team/model filters are applied client-side so they survive proxies that
+  ignore the query params, and unknown or ambiguous alias references are
+  refused before the proxy is called. The output names callers without ever
+  echoing the hash: from the live key list (`(master key)` for the key we
+  authenticate with) or the alias recorded in the row at request time
+  (`svc (gone)` for a key renamed, rotated or deleted since).
+- **`logs summary`** — the traffic and latency view over the same filtered
+  rows, next to `spend`'s money view: request count, spend, token totals,
+  cache hits, latency p50/p95/max and a per-model breakdown sorted by spend,
+  each model with its own latency percentiles.
+
+The log-row shapes vary across proxy versions, so `core/logs.py` is
+tolerant: `startTime`/`start_time` (ISO-8601 or epoch seconds), latency from
+`endTime - startTime` with the proxy's `ending_latency_s` as the fallback for
+failed rows (no `endTime`), and the model group from `model_group` `or`
+`model`.
+
+- Core: `core/logs.py` (`normalize`, `filter_logs`, `token_of`,
+  `key_alias_map`, `latency_ms`, `summary`), unit-tested in
+  `tests/test_core.py`; `logs list`/`logs summary` E2E (caller naming,
+  each filter with `--limit`, ambiguous-alias error, master/gone callers) and
+  the `spend --by key` → `logs list --key` drill-down workflow in
+  `tests/test_full_e2e.py`. `spend` now fetches its window through the same
+  helper — no behaviour change.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands
+  and the hashing/aliasing quirk they pair with. (v0.7.0: 154 tests, 85.5%
+  coverage.)
+
 ## [0.6.0] — 2026-10-03
 
 Customer (end-user) management: spend control gets its sixth leg, next to keys,

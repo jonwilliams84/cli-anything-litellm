@@ -2,7 +2,7 @@
 
 Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy from the shell.
 
-- **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails.
+- **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache).
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend.
 - **Audit:**
   - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
@@ -26,6 +26,8 @@ cli-anything-litellm customers list --budget eng-2026          # end users, capp
 cli-anything-litellm customers block acme --yes                # their user_id stops working, reversibly
 cli-anything-litellm budgets info eng-2026   # the budget and every key/team on it
 cli-anything-litellm budgets update eng-2026 --max-budget 200   # re-prices every attached key
+cli-anything-litellm logs list --key svc --limit 50   # the requests behind `spend` totals
+cli-anything-litellm logs summary --team eng   # traffic + latency p50/p95 over the window
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000
