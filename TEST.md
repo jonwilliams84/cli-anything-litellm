@@ -9,8 +9,8 @@ of a real LiteLLM v1.100.1 proxy.
 | File | Scope |
 |---|---|
 | `tests/test_harness.py` | Original build: core (`models`, `drift`, `lint`, `backend`) and CLI behaviours (dry-run, confirm, rotation, spend grouping, 401 hint). |
-| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused). |
-| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow). |
+| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused), and `logs.latency_ms` / `logs.filter_logs` / `logs.normalize` / `logs.token_of` / `logs.key_alias_map` / `logs.summary` (shape tolerance, sha256 vs alias vs ambiguous-alias key references, per-field filters, percentiles, per-model breakdown). |
+| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow. |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -131,6 +131,32 @@ of a real LiteLLM v1.100.1 proxy.
   the customer on the cap → `customers block` → `customers info` shows
   `blocked: true` → `customers unblock` → `customers delete --yes`.
 
+## Request-log coverage (`logs ...`, v0.7.0: `core/logs.py`)
+
+- `logs list` reads `/spend/logs` over the window `spend` uses (`--days`,
+  default 7; the log is written asynchronously, so fresh traffic shows up
+  late) and shows one row per request, newest first (`--limit`, default 25):
+  timestamp, model group, caller, user, call type, tokens, spend, latency,
+  cache hit. The row's `api_key` is the sha256 hash of the key — the output
+  names callers through the live key list (`(master key)` for our own key)
+  or the alias recorded in the row (`svc (gone)`), never the hash.
+- `--key` accepts an `sk-…` key (hashed before filtering), a hashed token, or
+  an alias resolved against `keys list` — an unknown or ambiguous alias is
+  refused before the proxy is called. `--user`, `--team` and `--model` filter
+  client-side (so they work even on proxies that ignore the query params),
+  and the output carries `matched` (rows in the window that survive the
+  filters) next to `shown`.
+- `logs summary` aggregates the same filtered rows: request count, spend,
+  token totals, cache hits, latency p50/p95/max and a per-model breakdown
+  sorted by spend with each model's own latency percentiles — the traffic
+  and latency view, next to `spend`'s money view.
+- Core tolerates the shape variants proxies emit: `startTime`/`start_time`
+  (ISO-8601 or epoch), the proxy's `ending_latency_s` fallback for rows with
+  no usable `endTime` (failed calls), `model_group` `or` `model`, and hashes
+  hidden in `metadata`.
+- Workflow: `spend --by key` names a key burning budget → `logs list --key
+  <alias>` names the requests behind that number (same log, drill-down view).
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 134 passed, 84.6% coverage (v0.6.0).
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 154 passed, 85.5% coverage (v0.7.0).

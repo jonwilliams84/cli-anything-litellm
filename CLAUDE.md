@@ -10,6 +10,7 @@ Click CLI over the LiteLLM proxy admin API. It is an HTTP client only: it never 
 - `core/users.py`: `/user/*` mutation bodies and id-or-email resolution.
 - `core/budgets.py`: `/budget/*` bodies (delete says `id`, the rest say `budget_id`).
 - `core/customers.py`: `/customer/*` bodies (block/unblock/delete say plural `user_ids`; new/update are singular).
+- `core/logs.py`: per-request rows from `/spend/logs` (the log stores sha256(key), so callers are named via the key list or the row's own alias — never the hash), filters, latency percentiles.
 - `core/drift.py`: config vs live, and node vs node.
 - `core/lint.py`: built-in rules and the policy engine (operators are documented in the module docstring).
 - `skills/cli-anything-litellm/SKILL.md` is the agent skill. `cli_anything/litellm/skills/SKILL.md` is a copy of it: keep them identical.

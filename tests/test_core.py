@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 
 from cli_anything.litellm.core import models as m
@@ -459,3 +462,126 @@ def test_customer_target_ambiguous_alias_is_refused_not_guessed():
 def test_customer_target_unknown_or_empty_is_none():
     assert cu.resolve_customer_target([customer(1)], "ghost") is None
     assert cu.resolve_customer_target([customer(1)], "") is None
+
+
+# ── logs ──────────────────────────────────────────────────────────────────
+
+from cli_anything.litellm.core import logs as lg
+
+
+def log(i=1, **kw):
+    row = {
+        "request_id": f"req-{i}",
+        "call_type": "/chat/completion",
+        "model": "bedrock/qwen-2.5",
+        "model_group": "qwen",
+        "api_key": "b" * 64,
+        "user": "svc-bot",
+        "team_id": "eng",
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "spend": 0.000012,
+        "startTime": f"2026-10-11T00:0{i}:00",
+        "endTime": f"2026-10-11T00:0{i}:02",
+        "cache_hit": False,
+        "metadata": {"user_api_key_alias": "svc"},
+    }
+    row.update(kw)
+    return row
+
+
+def test_latency_ms_from_start_end_and_skips_missing_end():
+    assert lg.latency_ms(log()) == 2000.0
+    bad = log(endTime=None, end_time=None)
+    assert lg.latency_ms(bad) is None
+
+
+def test_latency_ms_falls_back_to_proxy_latency_and_tolerates_shapes():
+    assert lg.latency_ms(log(start_time="2026-10-11T01:00:00Z")) == 2000.0
+    assert lg.latency_ms(log(startTime="2026-10-11", endTime="2026-10-11", ending_latency_s=1.25)) == 1250.0
+    assert lg.latency_ms(log(startTime=1792000000, endTime=1792000001)) == 1000.0
+
+
+def test_normalize_names_caller_never_the_hash():
+    aliases = {"b" * 64: "svc"}
+    n = lg.normalize(log(spend=1.2345678), aliases)
+    assert n["request_id"] == "req-1" and n["model"] == "qwen" and n["caller"] == "svc"
+    assert n["total_tokens"] == 150 and n["spend"] == 1.234568 and n["latency_ms"] == 2000.0
+    assert "b" * 64 not in json.dumps(n)
+
+
+def test_normalize_calls_gone_unknown_keys():
+    assert lg.normalize(log())["caller"] == "svc (gone)"
+    n = lg.normalize(log(metadata={}, user=None), {})
+    assert n["caller"] == "(unknown bbbbbbbbbb...)"
+    assert lg.normalize(log(api_key=None, metadata={}), {})["caller"] is None
+
+
+def test_normalize_utc_when():
+    assert lg.normalize(log())["when"] == "2026-10-11T00:01:00+00:00"
+
+
+def test_filter_logs_by_each_field():
+    rows = [log(1, model_group="qwen", model="qwen-1"), log(2, user="other", model_group="other", model="other-1", api_key="c" * 64), log(3, model_group="embed", model="embed-1", api_key="d" * 64), log(4, team_id="ops", model_group="qwen", model="qwen-2", api_key="e" * 64)]
+    assert [r["request_id"] for r in lg.filter_logs(rows, key="b" * 64)] == ["req-1"]
+    assert [r["request_id"] for r in lg.filter_logs(rows, user="other")] == ["req-2"]
+    assert [r["request_id"] for r in lg.filter_logs(rows, team="ops")] == ["req-4"]
+    assert [r["request_id"] for r in lg.filter_logs(rows, model="qwen")] == ["req-1", "req-4"]
+    assert [r["request_id"] for r in lg.filter_logs(rows, model="embed")] == ["req-3"]
+    assert lg.filter_logs([log()], key="c" * 64) == []
+    assert len(lg.filter_logs(rows)) == 4
+
+
+def test_filter_logs_key_also_matches_metadata_hash():
+    row = log(1, api_key=None)
+    row["metadata"]["user_api_key_hash"] = "b" * 64
+    assert lg.filter_logs([row], key="b" * 64) == [row]
+
+
+@pytest.mark.parametrize(
+    ("ref", "want"),
+    [
+        ("sk-secret", hashlib.sha256(b"sk-secret").hexdigest()),
+        ("a" * 64, "a" * 64),
+        ("svc", "b" * 64),
+    ],
+)
+def test_token_of(ref, want):
+    keys = [{"key_alias": "svc", "token": "b" * 64}, {"key_alias": "other", "token": "c" * 64}]
+    assert lg.token_of(ref, keys) == want
+
+
+def test_token_of_refuses_unknown_and_ambiguous_alias():
+    keys = [{"key_alias": "svc", "token": "b" * 64}, {"key_alias": "svc", "token": "c" * 64}]
+    with pytest.raises(ValueError, match="no key with alias 'nope'"):
+        lg.token_of("nope", [])
+    with pytest.raises(ValueError, match="matches 2 keys"):
+        lg.token_of("svc", keys)
+
+
+def test_key_alias_map_names_master_key():
+    keys = [{"key_alias": "svc", "token": "b" * 64}, {"key_alias": None, "token": "c" * 64, "key_name": "k"}]
+    m = lg.key_alias_map(keys, "sk-master")
+    assert m == {"b" * 64: "svc", "c" * 64: "k", hashlib.sha256(b"sk-master").hexdigest(): "(master key)"}
+
+
+def test_summary_totals_percentiles_and_per_model_breakdown():
+    rows = [
+        log(1, spend=0.5, model_group="qwen", model="qwen-1", prompt_tokens=10, completion_tokens=20),
+        log(2, spend=0.5, model_group="qwen", model="qwen-1", prompt_tokens=30, completion_tokens=40),
+        log(3, spend=0.2, model_group="embed", model="embed-1", startTime="2026-10-11T02:00:00", endTime="2026-10-11T02:00:10"),
+        log(4, spend=0.0, cache_hit=True, endTime=None, model_group="qwen", model="qwen-1"),
+    ]
+    s = lg.summary(rows)
+    assert s["requests"] == 4 and s["spend"] == 1.2 and s["prompt_tokens"] == 240 and s["completion_tokens"] == 160
+    assert s["cache_hits"] == 1
+    assert s["latency_ms"]["p50"] == 2000.0 and s["latency_ms"]["max"] == 10000.0
+    assert [m["model"] for m in s["models"]] == ["qwen", "embed"]
+    q = s["models"][0]
+    assert q["requests"] == 3 and q["spend"] == 1.0 and q["latency_ms"] == {"p50": 2000.0, "p95": 2000.0}
+
+
+def test_summary_on_no_logs_is_all_zeros():
+    s = lg.summary([])
+    assert s["requests"] == 0 and s["spend"] == 0 and s["cache_hits"] == 0
+    assert s["latency_ms"] == {"p50": None, "p95": None, "max": None} and s["models"] == []
