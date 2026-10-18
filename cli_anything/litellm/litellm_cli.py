@@ -24,6 +24,7 @@ from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import logs as logs_mod
 from cli_anything.litellm.core import models as models_mod
+from cli_anything.litellm.core import tags as tags_mod
 from cli_anything.litellm.core import teams as teams_mod
 from cli_anything.litellm.core import users as users_mod
 
@@ -452,6 +453,7 @@ KEY_COLS = [
     ("key_name", "KEY"),
     ("team_id", "TEAM"),
     ("user_id", "USER"),
+    ("tags", "TAGS"),
     ("spend", "SPEND"),
     ("max_budget", "BUDGET"),
     ("expires", "EXPIRES"),
@@ -479,6 +481,8 @@ def _key_row(k: dict) -> dict:
         "rpm_limit": k.get("rpm_limit"),
         "tpm_limit": k.get("tpm_limit"),
         "token": k.get("token"),
+        "tags": ", ".join(tags_mod.key_tags(k))
+        or None,  # metadata.tags (the proxy flat-maps `tags` on older shapes)
     }
 
 
@@ -530,8 +534,13 @@ def _resolve_token(conn, key_or_alias: str) -> str:
 @click.option("--budget-id", "budget_id", default=None, help="Attach a shared budget (`budgets create`).")
 @click.option("--rpm", type=int, default=None)
 @click.option("--tpm", type=int, default=None)
+@click.option(
+    "--tags",
+    default=None,
+    help="Comma-separated tags, e.g. feat-x,team-a — the labels `spend --by tag` bills by.",
+)
 @click.pass_context
-def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_id, rpm, tpm):
+def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_id, rpm, tpm, tags):
     body = {
         k: v
         for k, v in {
@@ -547,6 +556,11 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_i
         }.items()
         if v is not None
     }
+    if tags:
+        try:
+            body["metadata"] = tags_mod.as_metadata(None, tags_mod.parse_tags(tags))
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
     if _dry(ctx, "POST", "/key/generate", body):
         return
     res = _call(be.post, _conn(ctx), "/key/generate", body)
@@ -561,8 +575,13 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_i
 @click.option("--rpm", type=int, default=None)
 @click.option("--tpm", type=int, default=None)
 @click.option("--duration", default=None)
+@click.option(
+    "--tags",
+    default=None,
+    help="Comma-separated tags, e.g. feat-x,team-a (replaces the tag set; other metadata is kept).",
+)
 @click.pass_context
-def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, duration):
+def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, duration, tags):
     c = _conn(ctx)
     body = {
         k: v
@@ -576,9 +595,20 @@ def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, dura
         }.items()
         if v is not None
     }
-    if not body:
+    want_tags = None
+    if tags:
+        try:
+            want_tags = tags_mod.parse_tags(tags)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+    if not body and not want_tags:
         raise click.ClickException("nothing to update")
     body["key"] = _call(_resolve_token, c, key_or_alias)
+    if want_tags:
+        k = next((k for k in _call(all_keys, c) if k.get("token") == body["key"]), {})
+        # /key/update replaces the whole metadata object: merge over the key's
+        # existing metadata so a retag does not silently drop other fields.
+        body["metadata"] = tags_mod.as_metadata(k.get("metadata"), want_tags)
     if _dry(ctx, "POST", "/key/update", body):
         return
     _emit(ctx, _call(be.post, c, "/key/update", body))
@@ -1429,9 +1459,11 @@ def _aliases(conn) -> dict[str, str]:
     return logs_mod.key_alias_map(_call(all_keys, conn), conn.get("key"))
 
 
-def _log_filters(key, user, team, model) -> dict[str, str]:
+def _log_filters(key, user, team, model, tag) -> dict[str, str]:
     """The active filters, for the output header."""
-    return {k: v for k, v in {"key": key, "user": user, "team": team, "model": model}.items() if v}
+    return {
+        k: v for k, v in {"key": key, "user": user, "team": team, "model": model, "tag": tag}.items() if v
+    }
 
 
 @cli.group("logs")
@@ -1444,10 +1476,11 @@ def logs_grp():
 @click.option("--user", default=None, help="end-user / user_id the request carried.")
 @click.option("--team", default=None, help="team_id the calling key belongs to.")
 @click.option("--model", default=None, help="Model group.")
+@click.option("--tag", default=None, help="A tag the request carried (see `spend --by tag`).")
 @click.option("--days", default=7, type=int, help="Window in days (the log is written async).")
 @click.option("--limit", default=25, type=int, help="Newest N requests to show after filtering.")
 @click.pass_context
-def logs_list(ctx, key, user, team, model, days, limit):
+def logs_list(ctx, key, user, team, model, tag, days, limit):
     """One row per request, newest first — the drill-down behind `spend` totals.
 
     Logs are written asynchronously: right after traffic nothing is there yet.
@@ -1460,14 +1493,16 @@ def logs_list(ctx, key, user, team, model, days, limit):
         except ValueError as e:
             raise click.ClickException(str(e)) from e
     rows = logs_mod.filter_logs(_call(_fetch_logs, c, days), key=token, user=user, team=team, model=model)
+    if tag:
+        rows = tags_mod.filter_by_tags(rows, tag)
     aliases = _aliases(c)
     matched = len(rows)
-    rows = [logs_mod.normalize(r, aliases) for r in rows]
+    rows = [{**logs_mod.normalize(r, aliases), "tags": tags_mod.log_row_tags(r) or None} for r in rows]
     rows.sort(key=lambda r: r["when"] or "", reverse=True)
     rows = rows[: max(limit, 0)]
     data = {
         "window_days": days,
-        "filters": _log_filters(key, user, team, model),
+        "filters": _log_filters(key, user, team, model, tag),
         "matched": matched,
         "rows": rows,
     }
@@ -1490,9 +1525,10 @@ def logs_list(ctx, key, user, team, model, days, limit):
 @click.option("--user", default=None, help="end-user / user_id the request carried.")
 @click.option("--team", default=None, help="team_id the calling key belongs to.")
 @click.option("--model", default=None, help="Model group.")
+@click.option("--tag", default=None, help="A tag the request carried (see `spend --by tag`).")
 @click.option("--days", default=7, type=int, help="Window in days (the log is written async).")
 @click.pass_context
-def logs_summary(ctx, key, user, team, model, days):
+def logs_summary(ctx, key, user, team, model, tag, days):
     """Traffic and latency over the window: totals, p50/p95, per-model breakdown.
 
     `spend` is the money view (grouped by who to bill); this is the traffic
@@ -1506,11 +1542,12 @@ def logs_summary(ctx, key, user, team, model, days):
             token = logs_mod.token_of(key, _call(all_keys, c))
         except ValueError as e:
             raise click.ClickException(str(e)) from e
-    res = logs_mod.summary(
-        logs_mod.filter_logs(_call(_fetch_logs, c, days), key=token, user=user, team=team, model=model)
-    )
+    rows = logs_mod.filter_logs(_call(_fetch_logs, c, days), key=token, user=user, team=team, model=model)
+    if tag:
+        rows = tags_mod.filter_by_tags(rows, tag)
+    res = logs_mod.summary(rows)
     res["window_days"] = days
-    res["filters"] = _log_filters(key, user, team, model)
+    res["filters"] = _log_filters(key, user, team, model, tag)
     _emit(
         ctx,
         res,
@@ -1539,12 +1576,46 @@ def logs_summary(ctx, key, user, team, model, days):
 
 @cli.command("spend")
 @click.option("--days", default=7, type=int)
-@click.option("--by", "group_by", type=click.Choice(["model", "key", "team", "user"]), default="model")
+@click.option(
+    "--by",
+    "group_by",
+    type=click.Choice(["model", "key", "team", "user", "tag"]),
+    default="model",
+)
 @click.pass_context
 def spend(ctx, days, group_by):
-    """Spend and request totals over the last N days, grouped client-side from /spend/logs."""
+    """Spend and request totals over the last N days, grouped client-side from /spend/logs.
+
+    `--by tag` is the chargeback view: every key's `--tags` (see
+    `keys generate --tags`) ride along with its requests, so a request is
+    counted under each tag it carried; requests with no tag land in
+    `(untagged)`.
+    """
     c = _conn(ctx)
     logs = _call(_fetch_logs, c, days)
+    logs = logs if isinstance(logs, list) else []
+    if group_by == "tag":
+        data = {
+            "days": days,
+            "group_by": group_by,
+            "log_rows": len(logs),
+            "rows": tags_mod.spend_by_tag(logs),
+        }
+        _emit(
+            ctx,
+            data,
+            lambda d: _table(
+                d["rows"],
+                [
+                    ("tag", "TAG"),
+                    ("requests", "REQUESTS"),
+                    ("spend", "SPEND"),
+                    ("prompt_tokens", "PROMPT"),
+                    ("completion_tokens", "COMPLETION"),
+                ],
+            ),
+        )
+        return
     field = {"model": "model_group", "key": "api_key", "team": "team_id", "user": "user"}[group_by]
     agg: dict[str, dict[str, Any]] = {}
     alias: dict[str, str] = {}
@@ -1552,7 +1623,7 @@ def spend(ctx, days, group_by):
         alias = {k.get("token"): k.get("key_alias") or k.get("key_name") for k in _call(all_keys, c)}
         if c.get("key"):  # LiteLLM stores sha256(key); name the one we authenticate with
             alias[hashlib.sha256(c["key"].encode()).hexdigest()] = "(master key)"
-    for row in logs if isinstance(logs, list) else []:
+    for row in logs:
         g = row.get(field) or row.get("model") or "(rejected — no model)"
         if group_by == "key" and g not in alias:
             # The log row records the alias at request time, so a key deleted
@@ -1579,7 +1650,7 @@ def spend(ctx, days, group_by):
     data = {
         "days": days,
         "group_by": group_by,
-        "log_rows": len(logs) if isinstance(logs, list) else 0,
+        "log_rows": len(logs),
         "rows": rows,
     }
     _emit(

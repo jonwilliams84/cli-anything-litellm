@@ -585,3 +585,74 @@ def test_summary_on_no_logs_is_all_zeros():
     s = lg.summary([])
     assert s["requests"] == 0 and s["spend"] == 0 and s["cache_hits"] == 0
     assert s["latency_ms"] == {"p50": None, "p95": None, "max": None} and s["models"] == []
+
+
+# ── tags ──────────────────────────────────────────────────────────────────
+
+from cli_anything.litellm.core import tags as tg
+
+
+def test_parse_tags_splits_strips_and_dedupes():
+    assert tg.parse_tags("feat-x, team-a ,,feat-x") == ["feat-x", "team-a"]
+
+
+def test_parse_tags_accepts_a_list_and_refuses_empty():
+    assert tg.parse_tags(["feat-x"]) == ["feat-x"]
+    assert tg.parse_tags(None) == []
+    with pytest.raises(ValueError, match="no usable tag names"):
+        tg.parse_tags(" , ,")
+    with pytest.raises(ValueError, match="no usable tag names"):
+        tg.parse_tags([])
+
+
+def test_as_metadata_merges_and_requires_tags():
+    assert tg.as_metadata(None, ["feat-x"]) == {"tags": ["feat-x"]}
+    assert tg.as_metadata({"team": "eng"}, ["feat-x"]) == {"team": "eng", "tags": ["feat-x"]}
+    with pytest.raises(ValueError, match="no tags to set"):
+        tg.as_metadata({}, [])
+
+
+def test_key_tags_reads_metadata_and_flat_shapes():
+    assert tg.key_tags({"metadata": {"tags": ["b", "a"]}}) == ["a", "b"]
+    assert tg.key_tags({"tags": ["feat-x"]}) == ["feat-x"]  # older proxies flat-map it
+    assert tg.key_tags({}) == []
+    assert tg.key_tags({"metadata": "legacy-string"}) == []
+
+
+def test_log_row_tags_tolerates_the_json_text_column():
+    assert tg.log_row_tags({"request_tags": '["feat-x","team-a"]'}) == ["feat-x", "team-a"]
+    assert tg.log_row_tags({"request_tags": ["feat-x"]}) == ["feat-x"]
+    assert tg.log_row_tags({"request_tags": "feat-x, team-a"}) == ["feat-x", "team-a"]
+    assert tg.log_row_tags({"request_tags": "not-json"}) == ["not-json"]  # garbage tolerated, comma-split
+
+
+def test_log_row_tags_metadata_fallback_and_absence():
+    assert tg.log_row_tags({"metadata": {"tags": ["feat-x"]}}) == ["feat-x"]
+    assert tg.log_row_tags({"tags": ["feat-x"]}) == ["feat-x"]
+    assert tg.log_row_tags({"request_tags": "null"}) == []
+    assert tg.log_row_tags({}) == []
+
+
+def test_filter_by_tags_matches_rows_carrying_the_tag():
+    rows = [{"request_tags": '["feat-x"]'}, {"request_tags": '["team-a"]'}, {}]
+    assert [r for r in tg.filter_by_tags(rows, "feat-x")] == [rows[0]]
+
+
+def test_spend_by_tag_counts_multiples_and_untagged_once():
+    rows = [
+        {"request_tags": '["feat-x","team-a"]', "spend": 1.0, "prompt_tokens": 10, "completion_tokens": 5},
+        {"request_tags": '["feat-x"]', "spend": 0.5, "prompt_tokens": 2, "completion_tokens": 1},
+        {"api_key": "hash", "spend": 0.25, "prompt_tokens": 1, "completion_tokens": 1},  # no tags
+    ]
+    rows = tg.spend_by_tag(rows)
+    by_tag = {r["tag"]: r for r in rows}
+    assert by_tag["feat-x"] == {
+        "tag": "feat-x",
+        "requests": 2,
+        "spend": 1.5,
+        "prompt_tokens": 12,
+        "completion_tokens": 6,
+    }
+    assert by_tag["team-a"]["requests"] == 1
+    assert by_tag[tg.UNTAGGED]["requests"] == 1
+    assert [r["tag"] for r in rows] == ["feat-x", "team-a", tg.UNTAGGED]  # sorted by spend

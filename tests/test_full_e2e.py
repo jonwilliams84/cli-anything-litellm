@@ -962,3 +962,117 @@ def test_workflow_spend_total_then_logs_drill_down_per_key():
     d = json.loads(run(["--json", "logs", "list", "--key", "svc"], get=log_proxy(rows)).output)
     assert d["matched"] == 2
     assert {row["request_id"] for row in d["rows"]} == {"req-1", "req-2"}
+
+
+# ── tags: key tagging and per-tag spend attribution ───────────────────────
+
+
+def test_keys_generate_tags_dry_run_sends_metadata_sends_nothing():
+    post = mock.Mock()
+    r = run(["--dry-run", "keys", "generate", "--alias", "feat", "--tags", "feat-x, team-a,feat-x"], post=post)
+    assert json.loads(r.output)["body"]["metadata"] == {"tags": ["feat-x", "team-a"]}
+    post.assert_not_called()
+
+
+def test_keys_generate_refuses_a_tag_of_nothing_before_the_proxy():
+    post = mock.Mock()
+    r = run(["keys", "generate", "--alias", "feat", "--tags", " , ,"], post=post)
+    assert r.exit_code != 0 and "no usable tag names" in r.output
+    post.assert_not_called()
+
+
+def test_keys_update_tags_merge_over_existing_metadata():
+    keys = {"keys": [{"token": "tok-1", "key_alias": "svc", "metadata": {"team": "eng", "tags": ["old"]}}], "total_pages": 1}
+    post = mock.Mock(return_value={"token": "tok-1"})
+    r = run(["--json", "keys", "update", "svc", "--tags", "feat-x,old"], get=lambda c, p, **k: keys, post=post)
+    body = post.call_args.args[2]
+    assert body["key"] == "tok-1"
+    assert body["metadata"] == {"team": "eng", "tags": ["feat-x", "old"]}  # tags replaced, rest kept
+
+
+def test_keys_update_refuses_empty_tags_before_the_proxy():
+    post = mock.Mock()
+    r = run(["keys", "update", "svc", "--tags", " ,"], post=post)
+    assert r.exit_code != 0 and "no usable tag names" in r.output
+    post.assert_not_called()
+
+
+def test_keys_list_rows_carry_tags_from_both_shapes():
+    keys = {
+        "keys": [
+            {"key_alias": "svc", "metadata": {"tags": ["b", "a"]}},
+            {"key_alias": "old", "tags": ["z"]},  # older proxies flat-map tags
+            {"key_alias": "plain"},
+        ],
+        "total_pages": 1,
+    }
+    r = run(["--json", "keys", "list"], get=lambda c, p, **k: keys)
+    rows = json.loads(r.output)
+    assert [row["tags"] for row in rows] == ["a, b", "z", None]
+
+
+TAGS = ["feat-x", "team-a"]
+
+
+def test_spend_by_tag_counts_each_tag_and_untagged_once():
+    rows = [
+        log_row(1, spend=1.0, request_tags=json.dumps(TAGS)),
+        log_row(2, spend=0.5, request_tags=["feat-x"]),
+        log_row(3, spend=0.25, request_tags=json.dumps(["team-a"])),
+        log_row(4, spend=0.25),  # no tags
+    ]
+    r = run(["--json", "spend", "--by", "tag"], get=log_proxy(rows))
+    d = json.loads(r.output)
+    assert d["group_by"] == "tag" and d["log_rows"] == 4
+    assert [row["tag"] for row in d["rows"]] == ["feat-x", "team-a", "(untagged)"]
+    feat = next(row for row in d["rows"] if row["tag"] == "feat-x")
+    assert feat["requests"] == 2 and feat["spend"] == 1.5 and feat["prompt_tokens"] == 200
+
+    r = run(["spend", "--by", "tag"], get=log_proxy(rows))
+    assert "feat-x" in r.output and "(untagged)" in r.output
+
+
+def test_logs_list_and_summary_filter_by_tag():
+    rows = [
+        log_row(1, request_tags='["feat-x","team-a"]'),
+        log_row(2, request_tags=json.dumps(["team-a"])),
+        log_row(3),
+    ]
+    d = json.loads(run(["--json", "logs", "list", "--tag", "feat-x"], get=log_proxy(rows)).output)
+    assert d["filters"] == {"tag": "feat-x"} and d["matched"] == 1 and d["rows"][0]["request_id"] == "req-1"
+    assert d["rows"][0]["tags"] == ["feat-x", "team-a"]
+
+    s = json.loads(run(["--json", "logs", "summary", "--tag", "team-a"], get=log_proxy(rows)).output)
+    assert s["requests"] == 2 and s["filters"] == {"tag": "team-a"}
+
+
+def test_workflow_tag_chargeback_generate_then_spend_then_logs_drill_down():
+    """The point of tags: mint `feat-x` onto a key, then bill the feature from
+    the log — `spend --by tag` for the money, `logs list --tag` for the rows,
+    `keys update --tags` to move later traffic onto the right label."""
+    post = mock.Mock(return_value={"token": "sk-new"})
+    r = run(["--json", "keys", "generate", "--alias", "feat", "--tags", "feat-x"], post=post)
+    assert post.call_args.args[1:] == ("/key/generate", {"key_alias": "feat", "metadata": {"tags": ["feat-x"]}})
+
+    rows = [
+        log_row(1, request_tags='["feat-x"]', spend=2.0),
+        log_row(2, request_tags=json.dumps(["other"]), spend=1.0),
+    ]
+
+    def get(c, p, **k):
+        if p == "/spend/logs":
+            return rows
+        if p == "/key/list":
+            return {"keys": [{"key_alias": "feat", "token": SVC_TOKEN, "metadata": {"tags": ["feat-x"]}}], "total_pages": 1}
+        return {}
+
+    per_tag = json.loads(run(["--json", "spend", "--by", "tag"], get=get).output)["rows"]
+    assert [row["tag"] for row in per_tag] == ["feat-x", "other"]
+
+    d = json.loads(run(["--json", "logs", "list", "--tag", "feat-x", "--limit", "1"], get=get).output)
+    assert d["matched"] == 1 and d["rows"][0]["caller"] == "feat" and d["rows"][0]["tags"] == ["feat-x"]
+
+    # a retag sends the merged metadata; the old tags stop accruing from now on
+    post2 = mock.Mock(return_value={"token": SVC_TOKEN})
+    r = run(["--dry-run", "keys", "update", "feat", "--tags", "feat-y, feat-x"], get=get, post=post2)
+    assert json.loads(r.output)["body"]["metadata"] == {"tags": ["feat-y", "feat-x"]}

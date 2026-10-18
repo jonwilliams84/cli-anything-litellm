@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.8.0] — 2026-10-18
+
+Tag-based spend attribution: the chargeback dimension between keys and models.
+
+A *tag* is a free label on a virtual key — a feature (`feat-checkout`), a
+project, a cost centre. The proxy copies the key's `metadata.tags` into its
+spend log, where every row's `request_tags` records what the request carried,
+so one key can serve several features and still be billed per feature —
+"how much does feature X cost" is answerable without minting a key per
+feature. The CLI already read `tags` and `metadata` out of `keys rotate`
+(the rotation carries them over to the replacement key) but had no way to set
+them and nowhere the numbers appeared. The tag story is now complete across
+the key lifecycle and the two readers of the spend log:
+
+- **`keys generate --tags feat-x,team-a`** — tags a new key (stored as
+  `metadata.tags`). A value that parses to nothing (`" , ,"`) is refused
+  before the proxy is called.
+- **`keys update <key> --tags …`** — re-tags a live key: the tag set is
+  replaced, but merged over the key's existing metadata, because
+  `/key/update` swaps the whole metadata object — a plain retag must not
+  silently drop the other metadata fields.
+- **`keys list`** — a TAGS column (and a `tags` field in `--json`),
+  tolerant of the flat `tags` older proxies emit next to `metadata.tags`.
+- **`spend --by tag`** — the money view per tag, aggregated client-side from
+  `/spend/logs` exactly like the other `spend` groupings. Unlike those, a
+  request can ride *several* tags at once: it is counted under each of them,
+  and rows without tags are counted once, as `(untagged)`.
+- **`logs list --tag T` / `logs summary --tag T`** — the drill-down behind one
+  tag's number, filtered client-side (a request names every tag it carried);
+  `logs list` rows now also carry the row's tags (`tags`, list or null) and
+  the filter shows in the header.
+- Core: `core/tags.py` (`parse_tags`, `as_metadata`, `key_tags`,
+  `log_row_tags`, `filter_by_tags`, `spend_by_tag`), unit-tested in
+  `tests/test_core.py`; E2E (dry-run metadata, empty-tag refusal, metadata
+  merge on update, both key shapes in `keys list`, the `spend --by tag`
+  aggregation and `logs --tag` filters) and the tag-chargeback workflow
+  (generate → spend → logs drill-down → retag) in `tests/test_full_e2e.py`.
+- Docs: README, `TEST.md` and the SKILL (both copies) cover the new commands
+  and the JSON-text `request_tags` column quirk they pair with.
+  (v0.8.0: 170 tests, 87.1% coverage.)
+
 ## [0.7.0] — 2026-10-11
 
 Request logs: per-request observability from the spend log the CLI already
