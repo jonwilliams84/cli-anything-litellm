@@ -3,12 +3,13 @@ name: cli-anything-litellm
 description: >-
   Administer, tune and audit a LiteLLM proxy from the shell: model groups and
   replicas, live router settings, guardrails, virtual keys (create, limit,
-  block, rotate, delete), user accounts (create, update, delete), teams
+  tag, block, rotate, delete), user accounts (create, update, delete), teams
   (create, update, members, block, delete), budgets (reusable spend caps keys
   reference by budget_id: create, update, delete), customers (end users of the
   app behind the proxy: track and cap by user_id, block, delete), per-request
   logs from the spend log (who called what, at what spend/latency, filterable
-  by key/user/team/model) and spend.
+  by key/user/team/model/tag), spend (grouped by model/key/team/user/tag) and
+  tags on keys for per-feature chargeback.
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
@@ -50,7 +51,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | **Would this config change break a recorded decision?** | `lint --config … --policy policy.yaml` (exit 1 = errors) |
 | **Are the nodes behind the VIP identical?** | `fleet diff --node URL1 --node URL2` (exit 2 = differ) |
 | Keys: list / inspect | `keys list [--team T]`, `keys info <alias|sk-…|hash>` |
-| Keys: issue / limit | `keys generate --alias A --models m1,m2 --duration 90d --max-budget 5 --rpm 60` (or `--budget-id B` to inherit a shared budget), `keys update A --rpm 30` |
+| Keys: issue / limit / tag | `keys generate --alias A --models m1,m2 --duration 90d --max-budget 5 --rpm 60` (or `--budget-id B` to inherit a shared budget), `keys update A --rpm 30`, `keys generate|update --tags feat-x,team-a` (tags are the chargeback labels `spend --by tag` bills by) |
 | Keys: stop / restore / replace / remove | `keys block A`, `keys unblock A`, `keys rotate A` (carries `budget_id` over), `keys delete A` |
 | Budgets: list / inspect | `budgets list`, `budgets info <budget_id>` (also names every key and team on it) |
 | Budgets: create / re-price / remove | `budgets create --budget-id B --max-budget 100 --duration 30d [--soft-budget 90] [--parallel 5] [--model-max-budget '{"gpt-4o": 0.01}']`, `budgets update B --max-budget 200` (hit every attached key, team and user at once), `budgets delete B --yes` (attached keys/teams keep working on their own limits) |
@@ -66,9 +67,10 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | User accounts: list / inspect | `users list [--role R] [--team T]`, `users info <user_id|email>` (also lists the user's keys) |
 | User accounts: create | `users create --user-id U [--email E] [--role proxy_admin_viewer] [--teams a,b] [--max-budget 5]` — never mints a key; issue one with `keys generate --user U` |
 | User accounts: change / remove | `users update U --teams a,b [--role R] [--max-budget N]`, `users delete U --yes` (also invalidates every key the user owns — run `users info` first) |
-| Who is using it / what does it cost? | `spend --days 7 --by model|key|team|user` |
-| Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
-| Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M] [--days 7]` |
+| Who is using it / what does it cost? | `spend --days 7 --by model|key|team|user|tag` |
+| How much does one feature (or project, or cost centre) cost? | `spend --by tag` — keys tagged with `keys generate|update --tags`; a request riding several tags is counted under each, `(untagged)` for none |
+| Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M|--tag T] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
+| Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M|--tag T] [--days 7]` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
@@ -149,6 +151,16 @@ when there is no TTY.
 - **Placeholder credentials** (`api_key: none`) are reported by `lint` as
   `info`, not as leaked secrets: they mean the backend takes no key at all, which
   is worth a deliberate decision.
+- **Tags are the chargeback dimension between keys and models.** `keys
+  generate --tags feat-x,team-a` stores them at `metadata.tags` (older proxies
+  flat-map them to `tags` — `keys list` tolerates both) and the proxy copies
+  them into the spend log's `request_tags` column, which is *text*: a
+  JSON-encoded list on current proxies, a bare list or comma-separated string
+  on others. A request is billed under every tag it carried, so one key can
+  serve several features; requests with no tags land in `(untagged)`.
+  `keys update --tags` replaces the tag set and keeps the rest of the key's
+  metadata (`/key/update` otherwise replaces the whole object), and `keys
+  rotate` carries the tags over to the replacement key.
 
 ## Site policy files
 
