@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.9.0] — 2026-10-24
+
+Server-side spend reports: the wide-window money view the CLI could not carry.
+
+Until now every spend number came from the same trick — download the raw
+`/spend/logs` rows in the window and aggregate them client-side (`spend`,
+`logs summary`). Exact and shape-tolerant, but a 90-day window on a busy
+proxy means moving thousands of rows to produce a few numbers, and there was
+no per-day picture at all. The proxy has always kept that log in its database
+and aggregated it server-side — the numbers behind the Admin UI's usage
+charts — and ships an endpoint for reading them: `/global/spend/report`
+with `group_by=team|api_key|model|customer`. The CLI never exposed it. Now:
+
+- **`usage report [--by day|team|api_key|model|customer] [--days N]`**
+  (default `--by day`) — spend and token totals per day (or per
+  team / key / model / end user) over the window, one small response
+  instead of a log download.
+- **`--start YYYY-MM-DD --end YYYY-MM-DD`** — an explicit window for reports
+  wider than any sensible log download (a month, a quarter). One-sided or
+  inverted ranges and non-dates are refused before the proxy is called.
+- **`--limit N`** caps the newest rows shown; the roll-up totals in the
+  header and in `--json` come from the full report.
+
+Trade-offs are documented, not hidden: there is no per-request drill-down
+from the report (narrow the window and use `logs list`), and the report's
+group ids are the proxy's own — an `api_key` row is the log's sha256(key)
+hash, named exactly the way `spend --by key` names callers (through the live
+key list, the alias recorded at request time, or `(master key)` — the hash
+itself never reaches the output), and a row that names no group lands in
+`(unattributed)` rather than being dropped. `--by day` has no server-side
+form (the proxy always groups by an entity within the day), so it sums the
+default rows client-side — still one request.
+
+Core: `core/usage.py` (`window`, `params`, `as_rows`, `normalize`, `totals`),
+unit-tested in `tests/test_core.py` (windows, dimension mapping, envelope
+tolerance, hash naming, day summation, roll-ups); E2E over the mocked proxy
+in `tests/test_full_e2e.py` (query construction, explicit ranges validated
+client-side, `--json` shape, `--limit`, the no-secret-in-output rule) and the
+workflow test proving `spend --by key` and `usage report --by api_key` name
+the same caller the same way and agree on the number, with `logs list --key`
+as the drill-down. Docs: README, `TEST.md` and the SKILL (both copies).
+(v0.9.0: 190 tests, 87.9% coverage.)
+
 ## [0.8.0] — 2026-10-18
 
 Tag-based spend attribution: the chargeback dimension between keys and models.

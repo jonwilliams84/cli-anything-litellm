@@ -9,7 +9,11 @@ description: >-
   app behind the proxy: track and cap by user_id, block, delete), per-request
   logs from the spend log (who called what, at what spend/latency, filterable
   by key/user/team/model/tag), spend (grouped by model/key/team/user/tag) and
-  tags on keys for per-feature chargeback.
+  tags on keys for per-feature chargeback; usage report — server-side spend
+  reports the proxy aggregates in its own
+  database (/global/spend/report: per
+  day/team/key/model/customer over any window, even one a raw-log download
+  could not carry).
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
@@ -71,6 +75,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | How much does one feature (or project, or cost centre) cost? | `spend --by tag` — keys tagged with `keys generate|update --tags`; a request riding several tags is counted under each, `(untagged)` for none |
 | Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M|--tag T] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
 | Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M|--tag T] [--days 7]` |
+| What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
@@ -169,3 +174,12 @@ recorded (ADRs, runbooks) into checks, so an agent tuning the proxy cannot
 quietly undo one: routing strategy, required pre-call checks, required
 guardrails, advertised context per deployment, secrets from env. Keep the policy
 file next to the config it governs, in the same repo.
+- **Wide windows do not download.** `spend --days 90` and `logs summary` pull
+  every raw row in the window and aggregate client-side — slow and heavy on a
+  busy proxy. `usage report` asks the proxy's own aggregation
+  (`/global/spend/report`, the numbers behind the Admin UI's charts) instead:
+  per day/team/key/model/customer, `--start/--end` for calendar windows.
+  There is no per-request drill-down from there — narrow the window and use
+  `logs list`. The report's `api_key` rows are sha256 hashes, named the same
+  way `spend --by key` names callers; `--by day` is summed client-side (the
+  endpoint has no day-only form), so it is still a single small response.

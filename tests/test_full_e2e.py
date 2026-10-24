@@ -1076,3 +1076,156 @@ def test_workflow_tag_chargeback_generate_then_spend_then_logs_drill_down():
     post2 = mock.Mock(return_value={"token": SVC_TOKEN})
     r = run(["--dry-run", "keys", "update", "feat", "--tags", "feat-y, feat-x"], get=get, post=post2)
     assert json.loads(r.output)["body"]["metadata"] == {"tags": ["feat-y", "feat-x"]}
+
+
+# ── usage report (server-side spend aggregation) ──────────────────────────
+
+HASH = "a" * 64
+REPORT_ROWS = [
+    {"date": "2026-10-02", "api_key": HASH, "spend": 0.25, "prompt_tokens": 40, "completion_tokens": 12},
+    {"date": "2026-10-02", "team_id": "team-q", "spend": 1.0},
+    {"date": "2026-10-01", "api_key": HASH, "spend": 1.5, "completion_tokens": 30},
+    {"data": "not a row"},  # tolerate junk in the envelope rather than crash
+]
+
+
+def test_usage_report_day_totals_group_client_side():
+    def get(c, p, **k):
+        assert p == "/global/spend/report"
+        return REPORT_ROWS
+
+    r = run(["usage", "report", "--days", "7"], get=get)
+    assert r.exit_code == 0
+    assert "by day: $2.75 over 2 day(s)" in r.output  # 1.5 + 0.25 + 1.0
+
+
+def test_usage_report_days_window_is_the_query_it_sends():
+    seen = {}
+
+    def get(c, p, **k):
+        if p == "/global/spend/report":
+            seen.update(k.get("params") or {})
+        return []
+
+    run(["usage", "report", "--days", "3"], get=get)
+    assert "group_by" not in seen  # day has no server-side form: default rows, summed client-side
+    from datetime import date, timedelta
+
+    e = date.today() + timedelta(days=1)
+    assert seen["start_date"] == (e - timedelta(days=4)).isoformat() and seen["end_date"] == e.isoformat()
+
+
+def test_usage_report_explicit_range_overrides_days_and_lands_in_the_query():
+    seen = {}
+
+    def get(c, p, **k):
+        if p == "/global/spend/report":
+            seen.update(k.get("params") or {})
+        return []
+
+    r = run(["usage", "report", "--days", "3", "--start", "2026-01-01", "--end", "2026-01-31"], get=get)
+    assert r.exit_code == 0 and seen == {"start_date": "2026-01-01", "end_date": "2026-01-31"}
+
+
+def test_usage_report_range_errors_before_the_proxy():
+    post = mock.Mock()
+    for args in (
+        ["usage", "report", "--start", "2026-01-01"],
+        ["usage", "report", "--start", "2026-1-1", "--end", "2026-01-31"],
+        ["usage", "report", "--start", "2026-02-01", "--end", "2026-01-31"],
+    ):
+        r = run(args, post=post)
+        assert r.exit_code != 0 and "Error" in r.output
+    post.assert_not_called()
+
+
+def test_usage_report_api_key_rows_are_named_like_spend_by_key():
+    def get(c, p, **k):
+        if p == "/global/spend/report":
+            return {"data": REPORT_ROWS}
+        if p == "/key/list":
+            return {"keys": [{"token": HASH, "key_alias": "svc"}]}
+        return {}
+
+    r = run(["--json", "usage", "report", "--by", "api_key", "--days", "7"], get=get)
+    assert r.exit_code == 0
+    out = json.loads(r.output)
+    names = {row["api_key"] for row in out["rows"]}
+    assert "svc" in names  # the hash is named through the live key list
+    assert HASH not in names  # and the secret-shaped hash never leaks into the output
+    first = next(row for row in out["rows"] if row["date"] == "2026-10-02" and row["api_key"] == "svc")
+    assert first["spend"] == 0.25 and first["prompt_tokens"] == 40
+    assert out["rows"][-1]["api_key"] == "(unattributed)"  # the junk row did not crash the view
+
+
+def test_usage_report_unknown_hash_is_unknown_not_a_secret():
+    def get(c, p, **k):
+        if p == "/global/spend/report":
+            return {"data": [{"date": "2026-10-01", "api_key": "f" * 64, "spend": 1.0}]}
+        return {}
+
+    r = run(["usage", "report", "--by", "api_key", "--days", "7"], get=get)
+    assert "svc" not in r.output and HASH not in r.output and "(unknown ffffffffff...)" in r.output
+
+
+def test_usage_report_entity_sanity_and_limit():
+    r = run(["--json", "usage", "report", "--by", "team", "--days", "7", "--limit", "1"], get=lambda c, p, **k: REPORT_ROWS if p == "/global/spend/report" else {})
+    assert r.exit_code == 0
+    out = json.loads(r.output)
+    assert len(out["rows"]) == 1
+    assert out["window"] == {"start_date": out["window"]["start_date"], "end_date": out["window"]["end_date"]}
+    row = out["rows"][0]
+    assert row["date"] == "2026-10-02" and row["team"] == "team-q" and row["spend"] == 1.0
+
+
+# ── workflow: the wide-window money view matches the drill-down window ────
+
+
+def test_workflow_spend_by_key_and_usage_report_agree_and_logs_drill_down():
+    """`spend --by key` (raw log, client-side) and `usage report --by api_key`
+    (server-side report) name the same caller the same way; `logs list --key`
+    then shows the requests behind it."""
+    log_rows = [
+        {
+            "api_key": HASH,
+            "spend": 1.5,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "startTime": "2026-10-01T10:00:00",
+            "endTime": "2026-10-01T10:00:03",
+            "model": "qwen",
+            "request_tags": '["feat-x"]',
+        },
+        {
+            "api_key": HASH,
+            "spend": 0.25,
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "startTime": "2026-10-02T10:00:00",
+            "endTime": "2026-10-02T10:00:02",
+            "model": "qwen",
+        },
+    ]
+
+    # the proxy's own report sees the same log: the two requests, per key and day
+    report_rows = [
+        {"date": "2026-10-01", "api_key": HASH, "spend": 1.5, "prompt_tokens": 10, "completion_tokens": 5},
+        {"date": "2026-10-02", "api_key": HASH, "spend": 0.25, "prompt_tokens": 2, "completion_tokens": 1},
+    ]
+
+    def get(c, p, **k):
+        if p == "/key/list":
+            return {"keys": [{"token": HASH, "key_alias": "svc"}]}
+        if p == "/spend/logs":
+            return log_rows
+        if p == "/global/spend/report":
+            return {"data": report_rows}
+        return {}
+
+    r1 = run(["spend", "--by", "key", "--days", "7"], get=get)
+    assert r1.exit_code == 0 and "svc" in r1.output and "1.75" in r1.output
+    r2 = run(["--json", "usage", "report", "--by", "api_key", "--days", "7"], get=get)
+    out = json.loads(r2.output)
+    assert r2.exit_code == 0 and round(out["spend"], 2) == 1.75 and "svc" in json.dumps(out["rows"])
+    r3 = run(["logs", "list", "--key", "svc", "--days", "7"], get=get)
+    assert r3.exit_code == 0 and r3.output.count("qwen") == 2

@@ -4,6 +4,7 @@ Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy
 
 - **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag).
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete — tagged for chargeback), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend, spend-by-tag.
+- **Report (server-side):** `usage report` reads `/global/spend/report`, the proxy's own DB aggregation behind the Admin UI's charts — spend and token totals per day, team, key, model or end user over a window you can make as wide as a quarter (`--start/--end`), without downloading the log.
 - **Audit:**
   - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
   - `fleet diff` compares proxies behind one VIP.
@@ -32,6 +33,8 @@ cli-anything-litellm budgets info eng-2026   # the budget and every key/team on 
 cli-anything-litellm budgets update eng-2026 --max-budget 200   # re-prices every attached key
 cli-anything-litellm logs list --key svc --limit 50   # the requests behind `spend` totals
 cli-anything-litellm logs summary --team eng   # traffic + latency p50/p95 over the window
+cli-anything-litellm usage report --by day --days 90    # the wide picture, aggregated by the proxy's DB
+cli-anything-litellm usage report --by api_key --start 2026-01-01 --end 2026-01-31  # a monthly spend report
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000
