@@ -1,4 +1,4 @@
-"""Per-request logs from the proxy's spend log (``GET /spend/logs``).
+"""Per-request logs from the proxy's spend log (``GET /spend/logs/v2``, paged; see ``litellm_cli._fetch_logs``).
 
 Every completion the proxy serves is attributed to a row in its spend log:
 ``request_id``, ``call_type``, the model and its group, the (hashed) key that
