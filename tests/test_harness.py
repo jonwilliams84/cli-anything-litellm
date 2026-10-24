@@ -250,6 +250,7 @@ def test_spend_by_key_names_master_and_deleted_keys():
     master = hashlib.sha256(b"sk-master").hexdigest()
     logs = [
         {"api_key": master, "spend": 0, "model_group": ""},
+        {"api_key": "litellm_proxy_master_key", "spend": 0, "model_group": "m"},
         {
             "api_key": "a" * 64,
             "spend": 0.5,
