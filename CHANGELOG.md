@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- `spend`, `logs list` and `logs summary` now page through `/spend/logs/v2` (100 rows a page,
+  without prompt and response columns). The unpaged `/spend/logs?summarize=false` loaded every
+  row, prompts included, into the proxy: a 3-day window OOM-killed both pods of a 2Gi v1.106.3
+  proxy. It also truncates silently to its newest rows, so long-window totals could be short.
+  It remains only as the fallback when a proxy has no v2 route (404).
 - `spend --by key` and `logs` named the master key's own calls `(unknown litellm_pr…)`.
   Newer proxies (seen on v1.106.3) log them under the literal `litellm_proxy_master_key`
   instead of the key's sha256, so both names now map to `(master key)`.

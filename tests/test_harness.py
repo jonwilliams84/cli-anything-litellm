@@ -261,7 +261,7 @@ def test_spend_by_key_names_master_and_deleted_keys():
     ]
 
     def get(c, p, **k):
-        return logs if p == "/spend/logs" else {"keys": [], "total_pages": 1}
+        return logs if p.startswith("/spend/logs") else {"keys": [], "total_pages": 1}
 
     r = run(["--json", "spend", "--by", "key"], get=get)
     names = {row["key"] for row in json.loads(r.output)["rows"]}
@@ -275,3 +275,39 @@ def test_401_hint_mentions_master_key_mismatch():
     with mock.patch.object(be, "get", side_effect=get):
         r = CliRunner().invoke(cli_mod.cli, ["--url", "http://p", "--key", "k", "models", "list"])
     assert r.exit_code != 0 and "master keys differ" in r.output
+
+
+def _log(i):
+    return {"api_key": "a" * 64, "spend": 0.1, "model_group": "q", "metadata": {"user_api_key_alias": "svc"}}
+
+
+def test_spend_pages_through_v2_without_the_heavy_unpaged_call():
+    seen = []
+    pages = {1: [_log(1)] * 100, 2: [_log(2)] * 100, 3: [_log(3)] * 7}
+
+    def get(c, p, **k):
+        seen.append((p, dict(k.get("params") or {})))
+        if p == "/spend/logs/v2":
+            n = k["params"]["page"]
+            return {"data": pages[n], "total": 207, "page": n, "page_size": 100, "total_pages": 3}
+        return {"keys": [], "total_pages": 1}
+
+    r = run(["--json", "spend", "--by", "key"], get=get)
+    assert json.loads(r.output)["rows"][0]["requests"] == 207
+    log_calls = [(p, q) for p, q in seen if p.startswith("/spend/logs")]
+    assert [p for p, _ in log_calls] == ["/spend/logs/v2"] * 3
+    assert [q["page"] for _, q in log_calls] == [1, 2, 3]
+    assert all(q["page_size"] == cli_mod.LOG_PAGE_SIZE for _, q in log_calls)
+    assert all("summarize" not in q for _, q in log_calls)
+
+
+def test_spend_falls_back_to_unpaged_logs_when_proxy_has_no_v2():
+    def get(c, p, **k):
+        if p == "/spend/logs/v2":
+            raise be.ApiError(404, "Not Found", "http://p/spend/logs/v2")
+        if p == "/spend/logs":
+            return [_log(1), _log(2)]
+        return {"keys": [], "total_pages": 1}
+
+    r = run(["--json", "spend", "--by", "key"], get=get)
+    assert json.loads(r.output)["rows"][0]["requests"] == 2

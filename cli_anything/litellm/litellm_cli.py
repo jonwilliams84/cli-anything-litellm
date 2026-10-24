@@ -1443,17 +1443,43 @@ SUMMARY_COLS = [
 ]
 
 
+LOG_PAGE_SIZE = 100
+
+
 def _fetch_logs(conn, days: int) -> list[dict[str, Any]]:
-    """The proxy's spend log over the last ``days`` days (the window `spend` uses)."""
+    """The proxy's spend log over the last ``days`` days (the window `spend` uses).
+
+    Paged through ``/spend/logs/v2``, which leaves out the prompt and response
+    columns. The old unpaged ``/spend/logs?summarize=false`` loads every row,
+    prompts included, into the proxy worker: a 3-day window OOM-killed both
+    pods of a 2Gi proxy (v1.106.3). It also silently truncates to its newest
+    rows (header ``x-litellm-spend-logs-truncated``). It is used only when the
+    proxy has no v2 route.
+    """
     end = date.today() + timedelta(days=1)
     start = end - timedelta(days=days + 1)
-    logs = _call(
-        be.get,
-        conn,
-        "/spend/logs",
-        params={"start_date": start.isoformat(), "end_date": end.isoformat(), "summarize": "false"},
-    )
-    return logs if isinstance(logs, list) else []
+    window = {"start_date": f"{start.isoformat()} 00:00:00", "end_date": f"{end.isoformat()} 00:00:00"}
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        try:
+            res = be.get(conn, "/spend/logs/v2", params={**window, "page": page, "page_size": LOG_PAGE_SIZE})
+        except be.ApiError as e:
+            if e.status != 404 or page > 1:
+                raise
+            legacy = _call(
+                be.get,
+                conn,
+                "/spend/logs",
+                params={"start_date": start.isoformat(), "end_date": end.isoformat(), "summarize": "false"},
+            )
+            return legacy if isinstance(legacy, list) else []
+        if isinstance(res, list):  # a single unpaged answer
+            return res
+        rows.extend((res or {}).get("data") or [])
+        if page >= int((res or {}).get("total_pages") or 1):
+            return rows
+        page += 1
 
 
 def _aliases(conn) -> dict[str, str]:

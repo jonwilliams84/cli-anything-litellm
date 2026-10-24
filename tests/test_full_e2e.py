@@ -867,7 +867,7 @@ def log_row(i, **kw):
 
 def log_proxy(rows):
     def get(c, p, **k):
-        if p == "/spend/logs":
+        if p.startswith("/spend/logs"):
             return rows
         if p == "/key/list":
             return {"keys": [{"key_alias": "svc", "token": SVC_TOKEN}, {"key_alias": "web", "token": OTHER_TOKEN}], "total_pages": 1}
@@ -902,7 +902,7 @@ def test_logs_list_filters_by_alias_user_team_model():
     ]
 
     def get(c, p, **k):
-        if p == "/spend/logs":
+        if p.startswith("/spend/logs"):
             return rows
         if p == "/key/list":
             return {"keys": [{"key_alias": "svc", "token": SVC_TOKEN}, {"key_alias": "web", "token": OTHER_TOKEN}], "total_pages": 1}
@@ -920,7 +920,7 @@ def test_logs_list_refuses_ambiguous_alias_before_the_proxy():
     saw_logs = []
 
     def get(c, p, **k):
-        if p == "/spend/logs":
+        if p.startswith("/spend/logs"):
             saw_logs.append(True)
             return [log_row(1)]
         if p == "/key/list":
@@ -1060,7 +1060,7 @@ def test_workflow_tag_chargeback_generate_then_spend_then_logs_drill_down():
     ]
 
     def get(c, p, **k):
-        if p == "/spend/logs":
+        if p.startswith("/spend/logs"):
             return rows
         if p == "/key/list":
             return {"keys": [{"key_alias": "feat", "token": SVC_TOKEN, "metadata": {"tags": ["feat-x"]}}], "total_pages": 1}
@@ -1216,7 +1216,7 @@ def test_workflow_spend_by_key_and_usage_report_agree_and_logs_drill_down():
     def get(c, p, **k):
         if p == "/key/list":
             return {"keys": [{"token": HASH, "key_alias": "svc"}]}
-        if p == "/spend/logs":
+        if p.startswith("/spend/logs"):
             return log_rows
         if p == "/global/spend/report":
             return {"data": report_rows}

@@ -116,7 +116,7 @@ def filter_by_tags(rows: list[dict[str, Any]], want: str) -> list[dict[str, Any]
 
 
 def spend_by_tag(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Spend and request totals per tag, client-side from /spend/logs — the way
+    """Spend and request totals per tag, client-side from the paged spend log — the way
     ``spend --by model|key|team|user`` works, for the one grouping where a row
     can belong to a bucket *more than once* because several tags ride together.
 
