@@ -45,9 +45,11 @@ def _dt(value: Any) -> datetime | None:
         except (ValueError, OverflowError, OSError):
             return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    # The proxy writes naive UTC; left naive, astimezone() would read it as local time.
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def started(row: dict[str, Any]) -> datetime | None:
@@ -91,6 +93,9 @@ def _caller(row: dict[str, Any], aliases: dict[str, str]) -> str:
     return None
 
 
+MASTER_KEY_LITERAL = "litellm_proxy_master_key"
+
+
 def key_alias_map(keys: list[dict[str, Any]], auth_key: str | None = None) -> dict[str, str]:
     """Hashed token → alias, for naming callers the way ``spend --by key`` does.
 
@@ -100,6 +105,8 @@ def key_alias_map(keys: list[dict[str, Any]], auth_key: str | None = None) -> di
     out = {k["token"]: k.get("key_alias") or k.get("key_name") for k in keys if k.get("token")}
     if auth_key:
         out[hashlib.sha256(auth_key.encode()).hexdigest()] = "(master key)"
+    # Newer proxies (seen on v1.106.3) log the master key's calls under this literal instead.
+    out[MASTER_KEY_LITERAL] = "(master key)"
     return out
 
 

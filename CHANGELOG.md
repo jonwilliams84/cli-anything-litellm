@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- `spend --by key` and `logs` named the master key's own calls `(unknown litellm_pr…)`.
+  Newer proxies (seen on v1.106.3) log them under the literal `litellm_proxy_master_key`
+  instead of the key's sha256, so both names now map to `(master key)`.
+- Log timestamps were off by the local UTC offset outside UTC (an hour on BST). The proxy
+  writes `startTime` as naive UTC, which `astimezone()` read as local time.
+
 ## [0.9.0] — 2026-10-24
 
 Server-side spend reports: the wide-window money view the CLI could not carry.

@@ -521,6 +521,18 @@ def test_normalize_utc_when():
     assert lg.normalize(log())["when"] == "2026-10-11T00:01:00+00:00"
 
 
+def test_naive_start_time_is_utc_whatever_the_local_zone(monkeypatch):
+    import time
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        assert lg.normalize(log())["when"] == "2026-10-11T00:01:00+00:00"
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 def test_filter_logs_by_each_field():
     rows = [log(1, model_group="qwen", model="qwen-1"), log(2, user="other", model_group="other", model="other-1", api_key="c" * 64), log(3, model_group="embed", model="embed-1", api_key="d" * 64), log(4, team_id="ops", model_group="qwen", model="qwen-2", api_key="e" * 64)]
     assert [r["request_id"] for r in lg.filter_logs(rows, key="b" * 64)] == ["req-1"]
@@ -562,7 +574,12 @@ def test_token_of_refuses_unknown_and_ambiguous_alias():
 def test_key_alias_map_names_master_key():
     keys = [{"key_alias": "svc", "token": "b" * 64}, {"key_alias": None, "token": "c" * 64, "key_name": "k"}]
     m = lg.key_alias_map(keys, "sk-master")
-    assert m == {"b" * 64: "svc", "c" * 64: "k", hashlib.sha256(b"sk-master").hexdigest(): "(master key)"}
+    assert m == {
+        "b" * 64: "svc",
+        "c" * 64: "k",
+        hashlib.sha256(b"sk-master").hexdigest(): "(master key)",
+        "litellm_proxy_master_key": "(master key)",
+    }
 
 
 def test_summary_totals_percentiles_and_per_model_breakdown():

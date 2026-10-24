@@ -1624,6 +1624,7 @@ def spend(ctx, days, group_by):
         alias = {k.get("token"): k.get("key_alias") or k.get("key_name") for k in _call(all_keys, c)}
         if c.get("key"):  # LiteLLM stores sha256(key); name the one we authenticate with
             alias[hashlib.sha256(c["key"].encode()).hexdigest()] = "(master key)"
+        alias[logs_mod.MASTER_KEY_LITERAL] = "(master key)"  # how newer proxies (v1.106.3) log it
     for row in logs:
         g = row.get(field) or row.get("model") or "(rejected — no model)"
         if group_by == "key" and g not in alias:
