@@ -27,6 +27,7 @@ from cli_anything.litellm.core import models as models_mod
 from cli_anything.litellm.core import tags as tags_mod
 from cli_anything.litellm.core import teams as teams_mod
 from cli_anything.litellm.core import users as users_mod
+from cli_anything.litellm.core import usage as usage_mod
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -1667,6 +1668,78 @@ def spend(ctx, days, group_by):
             ],
         ),
     )
+
+
+# ── usage (server-side spend reports) ──────────────────────────────────────
+
+
+def _usage_cols(group_by: str) -> list[tuple[str, str]]:
+    if group_by == "day":
+        return [
+            ("date", "DATE"),
+            ("spend", "SPEND"),
+            ("prompt_tokens", "PROMPT"),
+            ("completion_tokens", "COMPLETION"),
+        ]
+    return [
+        ("date", "DATE"),
+        (group_by, group_by.upper()),
+        ("spend", "SPEND"),
+        ("prompt_tokens", "PROMPT"),
+        ("completion_tokens", "COMPLETION"),
+    ]
+
+
+@cli.group("usage")
+def usage_grp():
+    """Spend reports the proxy aggregates in its own database (/global/spend/report)."""
+
+
+@usage_grp.command("report")
+@click.option(
+    "--by",
+    "group_by",
+    type=click.Choice(usage_mod.DIMENSIONS),
+    default="day",
+    help="Day totals, or per-team / per-key / per-model / per-end-user rows. Default: day.",
+)
+@click.option("--days", default=7, type=int, help="Window in days (used without --start/--end).")
+@click.option("--start", default=None, help="Window start, YYYY-MM-DD. Requires --end; overrides --days.")
+@click.option("--end", default=None, help="Window end (inclusive), YYYY-MM-DD. Requires --start.")
+@click.option("--limit", default=None, type=int, help="Newest N rows to show; default all.")
+@click.pass_context
+def usage_report(ctx, group_by, days, start, end, limit):
+    """Spend and token totals over a window — aggregated on the proxy, not downloaded.
+
+    `spend` and `logs summary` aggregate raw log rows client-side, so a wide
+    window means downloading every row. This asks the proxy's own aggregation
+    (the numbers behind the Admin UI's charts) instead, for windows the log
+    download could not carry. There is no per-request drill-down from here:
+    narrow the window and use `logs list` for that.
+    """
+    c = _conn(ctx)
+    try:
+        win = usage_mod.window(days, start, end)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    names: dict[str, str] = {}
+    if group_by == "api_key":
+        names = _aliases(c)  # hash → alias, same naming as `spend --by key`
+    res = _call(be.get, c, "/global/spend/report", params=usage_mod.params(win, group_by))
+    rows = usage_mod.normalize(usage_mod.as_rows(res), group_by, names)
+    if limit is not None and limit >= 0:
+        rows = rows[:limit]
+    tot = usage_mod.totals(rows)
+    data = {"window": win, "group_by": group_by, **tot, "rows": rows}
+
+    def human(d):
+        click.echo(
+            f"spend {d['window']['start_date']} .. {d['window']['end_date']} by {d['group_by']}: "
+            f"${d['spend']} over {d['days']} day(s)"
+        )
+        _table(d["rows"], _usage_cols(group_by))
+
+    _emit(ctx, data, human)
 
 
 # ── drift / lint / fleet ────────────────────────────────────────────────────

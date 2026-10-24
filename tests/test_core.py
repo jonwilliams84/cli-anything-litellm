@@ -656,3 +656,103 @@ def test_spend_by_tag_counts_multiples_and_untagged_once():
     assert by_tag["team-a"]["requests"] == 1
     assert by_tag[tg.UNTAGGED]["requests"] == 1
     assert [r["tag"] for r in rows] == ["feat-x", "team-a", tg.UNTAGGED]  # sorted by spend
+
+
+# ── usage (server-side spend reports) ─────────────────────────────────────
+
+from datetime import date, timedelta
+
+from cli_anything.litellm.core import usage as usg
+
+
+def test_window_defaults_to_the_spend_window():
+    e = date.today() + timedelta(days=1)
+    assert usg.window(7) == {"start_date": (e - timedelta(days=8)).isoformat(), "end_date": e.isoformat()}
+
+
+def test_window_explicit_range_is_used_as_given():
+    assert usg.window(start="2026-01-01", end="2026-01-31") == {"start_date": "2026-01-01", "end_date": "2026-01-31"}
+
+
+def test_window_rejects_one_sided_and_inverted_ranges():
+    with pytest.raises(ValueError, match="go together"):
+        usg.window(start="2026-01-01")
+    with pytest.raises(ValueError, match="after"):
+        usg.window(start="2026-02-01", end="2026-01-31")
+
+
+def test_window_rejects_non_dates():
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        usg.window(start="next tuesday", end="2026-01-31")
+
+
+def test_params_maps_entity_dimensions_and_day_has_no_group_by():
+    assert usg.params({"start_date": "s", "end_date": "e"}, "team")["group_by"] == "team"
+    assert usg.params({"start_date": "s", "end_date": "e"}, "customer")["group_by"] == "customer"
+    assert "group_by" not in usg.params({"start_date": "s", "end_date": "e"}, "day")
+
+
+def test_as_rows_tolerates_the_envelopes():
+    assert usg.as_rows([{"date": "d"}]) == [{"date": "d"}]
+    assert usg.as_rows({"data": ["x"]}) == ["x"]
+    assert usg.as_rows({"daily": ["x"]}) == ["x"]
+    assert usg.as_rows({}) == [] and usg.as_rows(None) == []
+
+
+def test_normalize_names_key_hashes_like_spend_by_key():
+    out = usg.normalize(
+        [
+            {"date": "2026-10-02T12:00:00", "api_key": "a" * 64, "spend": 1.51235, "prompt_tokens": "100"},
+            {"date": "2026-10-01", "api_key": "88a8-not-a-hash"},
+        ],
+        "api_key",
+        {"a" * 64: "svc"},
+    )
+    assert out[0] == {
+        "date": "2026-10-02",
+        "api_key": "svc",
+        "spend": 1.5124,
+        "prompt_tokens": 100,
+        "completion_tokens": 0,
+    }
+    assert out[1]["api_key"] == "88a8-not-a-hash"  # not a hash: shown as-is (proxy marker or name)
+    # sorted newest day first; equals stay in log order
+
+
+def test_normalize_unknown_hash_is_named_without_leaking_it():
+    only = usg.normalize([{"date": "2026-10-01", "api_key": "f" * 64}], "api_key")[0]
+    assert only["api_key"] == "(unknown ffffffffff...)"
+
+
+def test_normalize_api_key_row_alias_recorded_at_request_time_wins():
+    only = usg.normalize([{"date": "d", "api_key": "a" * 64, "api_key_alias": "svc (gone)"}], "api_key")[0]
+    assert only["api_key"] == "svc (gone)"
+
+
+def test_normalize_team_rows_and_the_unattributed_fallback():
+    assert usg.normalize([{"date": "d", "team_name": "eng"}], "team")[0]["team"] == "eng"
+    assert usg.normalize([{"date": "d"}], "team")[0]["team"] == "(unattributed)"
+    assert usg.normalize([{"date": "d", "model": "gpt"}], "model")[0]["model"] == "gpt"
+
+
+def test_normalize_day_sums_entity_rows_into_one_row_per_day():
+    report = {
+        "data": [
+            {"date": "2026-10-01", "team_id": "team-eng", "spend": 1.0, "prompt_tokens": 10, "completion_tokens": 4},
+            {"date": "2026-10-01", "team_id": "team-q", "spend": 0.5},
+            {"date": "2026-10-02", "team_id": "team-eng", "spend": 2.0, "completion_tokens": 7},
+        ]
+    }
+    assert usg.normalize(usg.as_rows(report), "day") == [
+        {"date": "2026-10-01", "spend": 1.5, "prompt_tokens": 10, "completion_tokens": 4},
+        {"date": "2026-10-02", "spend": 2.0, "prompt_tokens": 0, "completion_tokens": 7},
+    ]
+
+
+def test_totals_roll_up_the_window():
+    rows = [
+        {"date": "2026-10-01", "spend": 1.0, "prompt_tokens": 10, "completion_tokens": 4},
+        {"date": "2026-10-02", "spend": "0.5"},
+    ]
+    assert usg.totals(rows) == {"rows": 2, "days": 2, "spend": 1.5, "prompt_tokens": 10, "completion_tokens": 4}
+    assert usg.totals([]) == {"rows": 0, "days": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}

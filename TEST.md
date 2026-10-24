@@ -9,8 +9,8 @@ of a real LiteLLM v1.100.1 proxy.
 | File | Scope |
 |---|---|
 | `tests/test_harness.py` | Original build: core (`models`, `drift`, `lint`, `backend`) and CLI behaviours (dry-run, confirm, rotation, spend grouping, 401 hint). |
-| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused), and `logs.latency_ms` / `logs.filter_logs` / `logs.normalize` / `logs.token_of` / `logs.key_alias_map` / `logs.summary` (shape tolerance, sha256 vs alias vs ambiguous-alias key references, per-field filters, percentiles, per-model breakdown), and `tags.parse_tags` / `tags.as_metadata` / `tags.key_tags` / `tags.log_row_tags` / `tags.filter_by_tags` / `tags.spend_by_tag` (tag parsing and emptiness refusal, metadata merge, `metadata.tags` vs flat `tags` vs the JSON-text `request_tags` column, per-row tag filters, the several-tags-per-request aggregation with `(untagged)`). |
-| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow, and the tag set (`keys generate --tags` / `keys update --tags` with metadata merge and empty-refusal, `keys list` tags column, `spend --by tag`, `logs list --tag` / `logs summary --tag`, and the tag-chargeback workflow: generate→spend→logs→retag). |
+| `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused), and `logs.latency_ms` / `logs.filter_logs` / `logs.normalize` / `logs.token_of` / `logs.key_alias_map` / `logs.summary` (shape tolerance, sha256 vs alias vs ambiguous-alias key references, per-field filters, percentiles, per-model breakdown), and `tags.parse_tags` / `tags.as_metadata` / `tags.key_tags` / `tags.log_row_tags` / `tags.filter_by_tags` / `tags.spend_by_tag` (tag parsing and emptiness refusal, metadata merge, `metadata.tags` vs flat `tags` vs the JSON-text `request_tags` column, per-row tag filters, the several-tags-per-request aggregation with `(untagged)`), and `usage.window` / `usage.params` / `usage.as_rows` / `usage.normalize` / `usage.totals` (window construction and validation, dimension→`group_by` mapping, envelope tolerance, sha256-named key rows with the recorded alias winning, the `day` client-side summation, roll-ups). |
+| `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow, and the tag set (`keys generate --tags` / `keys update --tags` with metadata merge and empty-refusal, `keys list` tags column, `spend --by tag`, `logs list --tag` / `logs summary --tag`, and the tag-chargeback workflow: generate→spend→logs→retag), and the usage-report set (`usage report`: `--days` and explicit `--start/--end` query construction, range validation before the proxy, `--json` shape, `--by api_key` naming through the live key list with no hash in the output, `--limit`, the junk-row tolerance) plus the money-view workflow (`spend --by key` and `usage report --by api_key` name the same caller the same way and agree on the total; `logs list --key` is the drill-down). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -189,6 +189,34 @@ of a real LiteLLM v1.100.1 proxy.
   feature → `logs list --tag feat-x` names the requests → `keys update --tags`
   moves later traffic onto the new label (dry-run shows the merged metadata).
 
+## Usage report coverage (`usage report`, v0.9.0: `core/usage.py`)
+
+- `usage report` reads `/global/spend/report` — the proxy's own aggregation of
+  its spend log in the database (the numbers behind the Admin UI's charts) —
+  so a wide money view is one small response instead of the raw-log download
+  `spend` / `logs summary` perform.
+- `--by day` (default) sums the report's entity rows client-side into one row
+  per day (`spend`, token totals); `--by team|api_key|model|customer` maps
+  straight to the endpoint's `group_by` and keeps one row per (day, entity).
+- The window is `--days` (the same inclusive one `spend` uses, ending
+  tomorrow) or an explicit `--start`/`--end` in YYYY-MM-DD for reports wider
+  than any sensible log download (a month, a quarter). One-sided ranges, bad
+  dates and inverted ranges are refused before the proxy is called.
+- api_key rows are the log's sha256(key) hash — named exactly like
+  `spend --by key`: through the live key list, an `api_key_alias` the proxy
+  recorded at request time, `(master key)` for our own key, or
+  `(unknown hh…)` for a hash nobody names; the hash itself never reaches the
+  output. A row that names no group is reported as `(unattributed)` rather
+  than dropped; number fields arrive as JSON strings or nulls and are coerced.
+- `--limit N` caps the newest rows shown; the header/`--json` roll-up
+  (`spend`, days, token totals) comes from the full report. There is no
+  per-request drill-down from the report — narrow the window and use
+  `logs list`.
+- Workflow: `spend --by key` (raw log, client-side) and
+  `usage report --by api_key` (server-side report) name the same caller the
+  same way and agree on the total; `logs list --key <alias>` names the
+  requests behind it.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 170 passed, 87.1% coverage (v0.8.0); `ruff check` and `ruff format --check` clean.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 190 passed, 87.9% coverage (v0.9.0); `ruff check` and `ruff format --check` clean.

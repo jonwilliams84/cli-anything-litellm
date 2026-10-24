@@ -12,6 +12,7 @@ Click CLI over the LiteLLM proxy admin API. It is an HTTP client only: it never 
 - `core/customers.py`: `/customer/*` bodies (block/unblock/delete say plural `user_ids`; new/update are singular).
 - `core/logs.py`: per-request rows from `/spend/logs` (the log stores sha256(key), so callers are named via the key list or the row's own alias — never the hash), filters, latency percentiles.
 - `core/drift.py`: config vs live, and node vs node.
+- `core/usage.py`: server-side spend reports from `/global/spend/report` (the proxy's own DB aggregation) — window/`group_by` query, envelope tolerance, day rows summed client-side (`--by day` has no server-side form); api_key hashes are named via `logs.key_alias_map`.
 - `core/tags.py`: keys carry `--tags` (stored as `metadata.tags`), `spend --by tag` bills per tag from the spend log's JSON-text `request_tags` column (several tags ride on one request; `(untagged)` for none), and `logs --tag` drills down.
 - `core/lint.py`: built-in rules and the policy engine (operators are documented in the module docstring).
 - `skills/cli-anything-litellm/SKILL.md` is the agent skill. `cli_anything/litellm/skills/SKILL.md` is a copy of it: keep them identical.
