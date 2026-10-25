@@ -1,5 +1,85 @@
 # Changelog
 
+## [0.13.0] — 2026-10-25
+
+The response cache: from one word of health to running it.
+
+The CLI reported the response cache as a single field in `status`
+(`cache_ping`, from `GET /cache/ping`) and nothing else. A house proxy
+with an opt-in Redis response cache could not be inspected, changed or
+flushed from the shell. Answering "why is this client seeing an old
+answer" meant the Admin UI, a Redis shell and a `curl` against the
+proxy. Now (shapes from v1.106.3, `litellm/proxy/caching_routes.py` and
+`litellm/proxy/management_endpoints/cache_settings_endpoints.py`):
+
+- **`cache ping`** (`GET /cache/ping`): alive, what cache, and the cache's
+  own parameters, masked. For a redis cache the proxy also writes a test
+  entry, so this is a write-and-read check, not a pure read. Exit 2 when the
+  cache is down or absent (the proxy's 503).
+- **`cache info`** (`GET /cache/redis/info`): the Redis under the cache —
+  memory against maxmemory and its policy, hit rate, evictions, expired
+  keys, total keys over every `dbN`, connected clients. `--json` keeps the
+  full INFO dict and the client list. `num_clients` of -1 (CLIENT LIST
+  restricted, common on managed Redis) is flagged, not hidden.
+- **`cache settings`** (`GET /cache/settings`): the settings the proxy would
+  re-save — the DB row decrypted and overlaid with the REDIS_* environment,
+  url precedence applied, the derived topology (node, cluster, sentinel),
+  credentials as `***REDACTED***`.
+- **`cache settings test --set k=v …`** (`POST /cache/settings/test`):
+  connects with the merged settings and reports success or failure. It never
+  saves. Exit 2 on failure.
+- **`cache settings update --set k=v …`** (`POST /cache/settings`): replaces
+  the stored settings with the effective ones plus your changes, and
+  re-initialises the cache on the answering worker. The endpoint REPLACES
+  the whole map, so the CLI sends every field the proxy reports, with the
+  redaction markers the proxy maps back to stored secrets. Needs a DB and
+  `STORE_MODEL_IN_DB`.
+- **`cache delete <key>…`** (`POST /cache/delete`): drop specific cached
+  responses by the `x-litellm-cache-key` header a response carries. A
+  stale answer goes; the next request re-hits its backend.
+- **`cache flushall`** (`POST /cache/flushall`): drop every cached response.
+
+Both mutations are `--yes`-gated off a TTY and dry-runnable.
+
+### Security
+- Cache credentials never ride argv. `--set password=…`, `--set
+  sentinel_password=…` and a url carrying userinfo are refused unless they are
+  `os.environ/NAME` references, which the redis client resolves at connect time.
+  A literal secret never reaches the proxy's DB, shell history or this CLI's output.
+- Output is redacted harder than the proxy's own mask. The proxy keeps four
+  real characters of a credential; the CLI masks secret-named values fully and
+  cuts urls to their origin.
+- The anti-replay rule is named before the save. A change of connection target
+  without a new credential makes the proxy DROP the stored credential rather
+  than replay it at the new target. The CLI lists what will drop, in
+  `dropped_credentials`, and warns in human output.
+
+### Guardrails for the operator
+- `cache settings update` refuses to carry over a connection target that is not
+  the live cache's. `GET /cache/settings` is the DB row plus REDIS_* env, and on
+  a proxy whose REDIS_* names the usage store while config.yaml points the cache
+  elsewhere it reports the usage store (seen live on the house proxy). Saving it
+  would move cached answers onto the counters' Redis and pin that over the
+  config at every restart. The CLI pings the live cache to compare; `--set
+  host=…` (a deliberate target) or `--yes` proceeds. `cache settings` warns.
+- `cache settings update` over empty reported settings (no DB row, no REDIS_*
+  env) is refused without `--yes`. The cache is configured in config.yaml, and
+  once a DB row exists it beats config.yaml at every restart
+  (`init_cache_settings_in_db`), so the save would pin a partial row over the
+  config's cache.
+
+Verified live with an admin key (read-only): `cache ping`, `cache info` and
+`cache settings` against the house proxy (v1.106.3), which is how the
+settings-vs-live mismatch above was found. The mutating routes (`settings
+test/update`, `delete`, `flushall`) were not run live; their shapes come from
+the v1.106.3 source, cited per fixture in `tests/cache_fixtures.py`.
+
+Core: `core/cache.py`. Tests: `tests/test_cache.py` (60: core units, the
+commands over the mocked proxy, three workflows, the installed command via
+`_resolve_cli`), with fixtures in `tests/cache_fixtures.py`. Docs: README,
+`TEST.md`, `CLAUDE.md` and the SKILL (both copies). (v0.13.0: 434 tests, 94%
+coverage; `core/cache.py` 100%.)
+
 ## [0.12.0] — 2026-10-25
 
 Routing resilience: fallbacks, paused deployments and recorded health.

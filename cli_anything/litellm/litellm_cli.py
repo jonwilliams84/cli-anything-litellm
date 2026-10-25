@@ -19,6 +19,7 @@ import yaml
 
 from cli_anything.litellm import __version__
 from cli_anything.litellm.core import backend as be
+from cli_anything.litellm.core import cache as cache_mod
 from cli_anything.litellm.core import budgets as budgets_mod
 from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
@@ -847,6 +848,331 @@ def fallbacks_test(ctx, model, fallback_type, text):
     _emit(ctx, out, human)
     if out["verdict"] != "failed_over":
         ctx.exit(2)
+
+
+# ── cache ──────────────────────────────────────────────────────────────────
+
+
+@cli.group("cache")
+def cache_grp():
+    """The response cache: health, the Redis under it, and what it stores.
+
+    Every route needs a proxy-admin key. `cache ping` is not a pure read: the
+    proxy also writes a test entry into the cache, which is how it proves
+    writes work.
+    """
+
+
+def _live_cache_ping(ctx: click.Context) -> dict[str, Any] | None:
+    """The ping row for the target check, or None when there is no live cache to compare (503)."""
+    try:
+        return cache_mod.ping_row(be.get(_conn(ctx), "/cache/ping"))
+    except be.ApiError as e:
+        if e.status == 503:
+            return None
+        raise _api_error(e) from e
+
+
+def _cache_ping(ctx: click.Context) -> dict[str, Any]:
+    """GET /cache/ping, normalised; a 503 (no cache / unhealthy) is an unhealthy verdict."""
+    c = _conn(ctx)
+    try:
+        res = be.get(c, "/cache/ping")
+    except be.ApiError as e:
+        if e.status == 503:
+            out = {"status": "unhealthy", "error": health_mod.redact_error(e.message)}
+            _emit(ctx, out, lambda r: click.echo(f"  unhealthy: {r['error']}"))
+            ctx.exit(2)
+        raise _api_error(e) from e
+    return cache_mod.ping_row(res)
+
+
+@cache_grp.command("ping")
+@click.pass_context
+def cache_ping(ctx):
+    """Is the response cache alive, and what is it? (GET /cache/ping)
+
+    For a redis cache the proxy PINGs it and writes a test entry — a full
+    read/write check (logged like any health probe). `--json` carries the
+    cache's own parameters, masked. Exit 2 when the cache is down or absent.
+    """
+    row = _cache_ping(ctx)
+
+    def _params_table(params: dict[str, Any]) -> None:
+        _table(
+            [{"field": k, "value": v} for k, v in sorted(params.items())],
+            [("field", "FIELD"), ("value", "VALUE")],
+        )
+
+    def human(r):
+        ping = (
+            f"ping {'ok' if r['ping_response'] else 'failed'}"
+            if r["ping_response"] is not None
+            else "no ping"
+        )
+        setr = f"set {r['set_cache_response']}" if r["set_cache_response"] is not None else "no set"
+        click.echo(f"  {r['status']} · {r['cache_type']} · {ping} · {setr}")
+        _params_table(r["params"])
+        if any(v is not None for v in r["health_check_params"].values()):
+            click.echo("  backend cache:")
+            _params_table(r["health_check_params"])
+
+    _emit(ctx, row, human)
+    if row["status"] != "healthy":
+        ctx.exit(2)
+
+
+@cache_grp.command("info")
+@click.pass_context
+def cache_info(ctx):
+    """The Redis the cache runs on: memory, hit rate, evictions, keys (GET /cache/redis/info).
+
+    The full INFO dict and the client list are in `--json`; the table is the
+    operator view. num_clients -1 means CLIENT LIST is restricted (managed
+    Redis). Every failure of this route surfaces as 503 "Service Unhealthy".
+    """
+    res = _call(be.get, _conn(ctx), "/cache/redis/info")
+    row = cache_mod.info_row(res)
+
+    def human(r):
+        s = r["summary"]
+        _table(
+            [{"field": k, "value": v} for k, v in s.items()],
+            [("field", "FIELD"), ("value", "VALUE")],
+        )
+        if r["num_clients"] == -1:
+            click.echo("  CLIENT LIST is not available on this Redis instance")
+
+    _emit(ctx, row, human)
+
+
+@cache_grp.group("settings", invoke_without_command=True)
+@click.pass_context
+def cache_settings_grp(ctx):
+    """The stored cache settings: the DB row plus the REDIS_* environment.
+
+    GET /cache/settings cannot see a cache configured in config.yaml — the
+    endpoint reads the proxy's database and environment only. Once a row
+    exists it beats config.yaml at every restart. Credential fields come
+    back as the proxy's redaction marker.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(cache_settings_show)
+
+
+@cache_settings_grp.command("show")
+@click.pass_context
+def cache_settings_show(ctx):
+    """What the proxy would re-save right now (GET /cache/settings).
+
+    current_values is the effective settings — the DB row's decrypted values
+    overlaid with REDIS_* env — with url precedence applied: a `url` hides
+    host/port/db/password, and the derived redis_type names the topology
+    (node, cluster from redis_startup_nodes, sentinel from sentinel_nodes).
+    It also pings the live cache (GET /cache/ping, which writes a test entry)
+    and warns when these settings name a different Redis from the one the
+    cache really uses.
+    """
+    res = _call(be.get, _conn(ctx), "/cache/settings")
+    row = cache_mod.settings_row(res)
+    ping = _live_cache_ping(ctx)
+    row["live_target"] = cache_mod.live_target(ping) if ping else {}
+    row["target_mismatch"] = cache_mod.target_mismatch(row["current_values"], ping) if ping else None
+
+    def human(r):
+        _table(
+            [{"field": k, "value": v} for k, v in sorted(r["current_values"].items())],
+            [("field", "FIELD"), ("value", "VALUE")],
+        )
+        if r["target_mismatch"]:
+            click.echo(
+                f"  warning: {r['target_mismatch']}. `cache settings update` would move the cache there."
+            )
+
+    _emit(ctx, row, human)
+
+
+def _set_option(fn):
+    return click.option(
+        "--set",
+        "sets",
+        multiple=True,
+        help=(
+            "key=value to change, repeatable (typed per the proxy's fields: ttl=300, ssl=true, "
+            'port=6379, redis_startup_nodes=\'[{"host": "h"}]\'; secrets as os.environ/NAME). '
+            "Sent over the effective settings, so nothing else changes."
+        ),
+    )(fn)
+
+
+def _settings_body(
+    ctx: click.Context, sets: tuple[str, ...]
+) -> tuple[dict[str, Any], dict[str, Any], list[str], dict[str, Any]]:
+    """The POST body for settings test/update: the proxy's current values with the --set changes."""
+    try:
+        changes = cache_mod.parse_sets(sets)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if not changes:
+        raise click.ClickException("nothing to change: pass --set key=value (see `cache settings show`)")
+    current = cache_mod.settings_row(_call(be.get, _conn(ctx), "/cache/settings"))["current_values"]
+    body = cache_mod.build_body(current, changes)
+    return body, changes, cache_mod.dropped_credentials(body, current), current
+
+
+def _dropped_warning(ctx: click.Context, names: list[str]) -> None:
+    """Human-mode only: in --json the names ride in the command's payload."""
+    if ctx.obj["json"] or not names:
+        return
+    for n in names:
+        click.echo(
+            f"  warning: the proxy will DROP the stored {n} — the connection target changed, and a stored "
+            f"credential is never replayed at a target it does not belong to. Pass --set {n}=os.environ/NAME "
+            "with the new target to keep a working cache."
+        )
+
+
+@cache_settings_grp.command("test")
+@_set_option
+@click.pass_context
+def cache_settings_test(ctx, sets):
+    """Try settings WITHOUT saving them (POST /cache/settings/test).
+
+    The same body `update` would send: the effective settings with your
+    changes, redaction markers included — the proxy restores the stored
+    credentials behind them for the test and connects with the result.
+    Never saved. Exit 2 when the connection fails.
+    """
+    body, changes, dropped, _current = _settings_body(ctx, sets)
+    if _dry(ctx, "POST", "/cache/settings/test", body):
+        _dropped_warning(ctx, dropped)
+        return
+    res = _call(be.post, _conn(ctx), "/cache/settings/test", body) or {}
+    out = {
+        "status": res.get("status"),
+        "message": res.get("message"),
+        "error": res.get("error"),
+        "changes": changes,
+        "dropped_credentials": dropped,
+    }
+
+    def human(r):
+        click.echo(f"  {r['status']}: {r['message']}")
+        if r.get("error"):
+            click.echo(f"  error: {r['error']}")
+
+    _emit(ctx, out, human)
+    if out["status"] != "success":
+        ctx.exit(2)
+
+
+@cache_settings_grp.command("update")
+@_set_option
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Allow pinning a DB row over a cache config.yaml owns, or onto a Redis the live cache isn't using.",
+)
+@click.pass_context
+def cache_settings_update(ctx, sets, yes):
+    """Change the stored cache settings (POST /cache/settings).
+
+    Replaces the settings row and re-initialises the cache on the answering
+    worker (needs a DB and STORE_MODEL_IN_DB). The --set changes ride over
+    the effective settings the proxy reports, so untouched fields — including
+    the redaction markers that stand for stored secrets — survive. Once a row
+    exists it beats config.yaml at every restart; `drift` on the config cannot
+    see it, which is why a save over an empty (config-owned) cache needs --yes.
+    """
+    body, changes, dropped, current = _settings_body(ctx, sets)
+    if cache_mod.empty_save(current, changes) and not yes:
+        raise click.ClickException(
+            "the proxy reports NO stored settings (no DB row, no REDIS_* env), so the cache is "
+            "configured in config.yaml — and a stored row beats the config at every restart "
+            "(init_cache_settings_in_db). Saving now would pin a partial row over the config's "
+            "cache_settings. Pass --yes to do exactly that, or move the whole cache_settings "
+            "block into --set."
+        )
+    ping = _live_cache_ping(ctx)
+    # Naming a target in --set is a deliberate move; carrying over the settings view's is not.
+    chose_target = any(f in changes for f in cache_mod.TARGET_FIELDS)
+    mismatch = (
+        cache_mod.target_mismatch(body.get("cache_settings") or {}, ping)
+        if ping and not chose_target
+        else None
+    )
+    if mismatch and not yes:
+        raise click.ClickException(
+            f"{mismatch}. Saving would move the response cache onto that Redis and pin it over "
+            "config.yaml at every restart. Pass --set host=<the live cache's host> to keep the "
+            "cache where it is, or --yes to move it."
+        )
+    if _dry(ctx, "POST", "/cache/settings", body):
+        _dropped_warning(ctx, dropped)
+        return
+    res = _call(be.post, _conn(ctx), "/cache/settings", body) or {}
+    out = {
+        "changed": changes,
+        "settings": cache_mod.redact_params(res.get("settings") or {}),
+        "message": res.get("message"),
+        "dropped_credentials": dropped,
+    }
+
+    def human(r):
+        what = ", ".join(f"{k}={v}" for k, v in r["changed"].items())
+        click.echo(f"  updated: {what} — {r['message']}")
+        _dropped_warning(ctx, dropped)
+
+    _emit(ctx, out, human)
+
+
+@cache_grp.command("delete")
+@click.argument("keys", nargs=-1, required=True)
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def cache_delete(ctx, keys, yes):
+    """Drop specific cached responses (POST /cache/delete).
+
+    KEYS are the `x-litellm-cache-key` header values of the responses to
+    invalidate — a stale answer a client keeps receiving. The next request
+    for that prompt re-hits the backend.
+    """
+    try:
+        body = cache_mod.delete_body(keys)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/cache/delete", body):
+        return
+    _confirm(ctx, yes, f"delete {len(body['keys'])} cache key(s)")
+    res = _call(be.post, _conn(ctx), "/cache/delete", body) or {}
+    out = {"deleted": body["keys"], "status": res.get("status")}
+    _emit(
+        ctx,
+        out,
+        lambda r: click.echo(f"  deleted {len(r['deleted'])} cache key(s): {', '.join(r['deleted'])}"),
+    )
+
+
+@cache_grp.command("flushall")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def cache_flushall(ctx, yes):
+    """Drop EVERY cached response (POST /cache/flushall).
+
+    The nuclear option after a config or prompt change made old answers
+    wrong: every cache entry goes, and the next request per prompt re-hits
+    (and re-pays) its backend. Redis-backed caches only.
+    """
+    if _dry(ctx, "POST", "/cache/flushall"):
+        return
+    _confirm(ctx, yes, "flush the whole response cache (every cached response is dropped)")
+    res = _call(be.post, _conn(ctx), "/cache/flushall") or {}
+    out = {"status": res.get("status"), "flushed": res.get("status") == "success"}
+    _emit(
+        ctx,
+        out,
+        lambda r: click.echo("  flushed: every cached response is gone; backends serve the next requests"),
+    )
 
 
 @cli.group("guardrails")

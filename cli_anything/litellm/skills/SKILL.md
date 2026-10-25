@@ -22,7 +22,10 @@ description: >-
   mcp access); guardrails — list config and DB guardrails, add/update/delete
   DB ones, test one on a text, usage (evaluated/blocked/fail rate per
   guardrail), the requests a guardrail judged, and the team submission queue.
-  Detects DRIFT between
+  The response cache — health (ping, plus the Redis under it: memory, hit
+  rate, evictions), the stored settings (show, test, update — secrets as
+  os.environ/ refs), targeted invalidation by x-litellm-cache-key and
+  flushall. Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
   exist only in its database, and fallback rules set through the API), differences between proxies behind one VIP (the
@@ -99,13 +102,20 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | MCP: grant / revoke a key's servers | `keys generate|update K --mcp-groups devtools,home` / `--mcp-servers ha,grafana` (`none` = no MCP at all; `''` clears groups) |
 | MCP: add / change / remove a DB server | `mcp add --name N --url U [--alias A] [--access-groups g] [--auth-type bearer_token --auth-value-env VAR]`, `mcp update S --access-groups g`, `mcp delete S --yes` |
 | MCP: who is connected right now? kick a session | `mcp sessions` (per worker process), `mcp sessions-close --user U|--prefix P --yes` |
+| Is the response cache alive? What is it? | `cache ping` — status, type, ping and a test write (it is NOT a pure read); `--json` carries the cache's own params, masked; exit 2 when down or absent |
+| Is the Redis under the cache healthy? | `cache info` — memory, maxmemory policy, hit rate, evictions, keyspace, total keys (`--json` keeps the full INFO dict and client list) |
+| What are the stored cache settings? | `cache settings` — the DB row + REDIS_* env the proxy reports, credentials as `***REDACTED***`; a cache configured in config.yaml does NOT appear here, and it warns when these settings name a different Redis from the live cache |
+| Change the cache (ttl, host, credentials)? | `cache settings test --set k=v …` (connects, never saves), then `cache settings update --set k=v …` — changes merge over the effective settings; secrets must be `os.environ/NAME`; warns when a target change drops the stored credential |
+| A client keeps getting a stale answer | `cache delete <key> --yes` — the key is the response's `x-litellm-cache-key` header; the next request re-hits the backend. `cache flushall --yes` drops everything |
 | What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 `users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
 `mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve`,
-`models block`, `fallbacks delete` need `--yes` when there is no TTY.
+`models block`, `fallbacks delete`, `cache delete`, `cache flushall`
+need `--yes` when there is no TTY (`cache settings update` needs it only to
+pin a row over a config-owned cache — see traps).
 
 ## Workflow for any change
 
@@ -285,6 +295,45 @@ nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
   one each time. So `health latest`'s SINCE is when the status began, and rows
   of deleted deployments linger (`gone`). Error text is upstream exception
   text: URLs are cut to their origin and key-shaped tokens masked.
+- **`cache ping` is a write, and every /cache/* route is proxy-admin.** The
+  ping PINGs the cache AND stores a test entry (`async_add_cache`), which is
+  how it proves writes work — treat it as a health probe, not a pure read.
+  A key that is not proxy admin gets 401 "Only proxy admin can be used…"
+  on every cache route (seen live). `cache info` failures all surface as
+  503 "Service Unhealthy (…)" — including "no cache" and "not redis", because
+  the handler wraps its own errors.
+- **Cache settings have TWO owners, the reverse of fallbacks.** `GET
+  /cache/settings` shows the DB row overlaid with REDIS_* env — it CANNOT see
+  a cache configured in config.yaml. Once a DB row exists it beats
+  config.yaml's `cache_settings` at every restart (`init_cache_settings_in_db`),
+  so `cache settings update` over empty reported settings (no row, no env)
+  needs `--yes`: it pins a row that will shadow the config's cache. `drift`
+  cannot see the DB row either.
+- **The settings view can name the WRONG Redis.** When config.yaml points the
+  cache at one Redis and the REDIS_* env names another (the usage /
+  rate-limit store, LiteLLM's `coordination_redis`), `GET /cache/settings`
+  reports the env's Redis, not the live cache (seen on the house proxy:
+  settings said litellm-redis, `cache ping` said litellm-cache). Saving that
+  would move cached answers onto the usage store, where LRU eviction pushes
+  out rate-limit and budget counters. `cache settings` warns, and `cache
+  settings update` refuses unless `--set host=…` names the target or `--yes`
+  is passed; both ping the live cache to compare.
+- **`cache settings update` REPLACES the map — the CLI merges for you.** The
+  endpoint keeps only credentials that are omitted or echoed as
+  `***REDACTED***`; every other field not re-sent is lost. The CLI therefore
+  sends the effective settings with your `--set` changes applied (markers
+  ride along; the proxy maps them back to the stored secrets). A stored
+  credential belongs to its connection target: change host/port/url/nodes
+  without a new `--set password=os.environ/NAME` and the proxy DROPS the
+  stored one (anti-replay) — the CLI names what will drop. Literal secrets
+  and userinfo-bearing urls are refused; pass `os.environ/NAME` (the redis
+  client resolves it at connect time). `redis_type` is UI-only (derived from
+  the node lists) and refused on `--set`.
+- **Cache invalidation keys come from response headers.** Every proxied
+  response carries `x-litellm-cache-key`; that is the string `cache delete`
+  takes. Deleting a key means the next request for that prompt re-hits (and
+  re-pays) the backend; `cache flushall` does that for every cached response.
+  Redis-backed caches only.
 - **Wide windows do not download.** `spend --days 90` and `logs summary` pull
   every raw row in the window and aggregate client-side — slow and heavy on a
   busy proxy. `usage report` asks the proxy's own aggregation
