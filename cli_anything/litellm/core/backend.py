@@ -121,5 +121,9 @@ def put(conn, path, body=None, **kw):
     return request(conn, "PUT", path, body=body, **kw)
 
 
+def patch(conn, path, body=None, **kw):
+    return request(conn, "PATCH", path, body=body, **kw)
+
+
 def delete(conn, path, **kw):
     return request(conn, "DELETE", path, **kw)

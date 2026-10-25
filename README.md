@@ -5,6 +5,7 @@ Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy
 - **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag).
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete — tagged for chargeback), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend, spend-by-tag.
 - **MCP gateway:** the MCP servers the proxy fronts — list, health, tools, access groups, add/update/delete DB servers, live gateway sessions — and which keys reach which servers (`mcp access`, `keys generate|update --mcp-groups/--mcp-servers`). Secrets embedded in server URLs, headers and env are never printed.
+- **Guardrails:** config and DB guardrails side by side, add/update/delete DB guardrails (PATCH only, secrets as `os.environ/` refs), `guardrails test` a text against one, usage and fail rates per guardrail, the requests a guardrail judged, and the team submission queue.
 - **Report (server-side):** `usage report` reads `/global/spend/report`, the proxy's own DB aggregation behind the Admin UI's charts — spend and token totals per day, team, key, model or end user over a window you can make as wide as a quarter (`--start/--end`), without downloading the log.
 - **Audit:**
   - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
@@ -43,6 +44,12 @@ cli-anything-litellm keys update rufus --mcp-groups devtools,home   # grant MCP 
 HA_MCP_TOKEN=... cli-anything-litellm mcp add --name home_assistant --alias ha --url https://ha:8123/api/mcp \
   --access-groups home --auth-type bearer_token --auth-value-env HA_MCP_TOKEN   # secret from env, never argv
 cli-anything-litellm mcp sessions                           # live gateway sessions on the worker that answered
+cli-anything-litellm guardrails list --all                  # config + DB guardrails (SRC=config|db)
+echo 'my card is 4111 1111 1111 1111' | cli-anything-litellm guardrails test pii-mask   # passed / modified / blocked (exit 3)
+cli-anything-litellm guardrails usage --days 30             # evaluated, blocked, fail rate; exit 2 if one is critical
+cli-anything-litellm guardrails logs prompt-injection --action blocked
+cli-anything-litellm guardrails add --name pii-mask --guardrail presidio --mode pre_call,post_call \
+  --api-base http://presidio:3000 --api-key os.environ/PRESIDIO_KEY --dry-run
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000
@@ -50,4 +57,4 @@ cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:400
 
 See [`skills/cli-anything-litellm/SKILL.md`](skills/cli-anything-litellm/SKILL.md) for the command map and the proxy behaviours it accounts for.
 
-Tested against LiteLLM **v1.100.1**; the MCP commands (v0.10.0) against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.
+Tested against LiteLLM **v1.100.1**; the MCP (v0.10.0) and guardrail (v0.11.0) commands against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.

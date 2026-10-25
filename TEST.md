@@ -2,7 +2,7 @@
 
 All tests are offline: `pip install -e '.[dev]' && pytest`. No proxy is needed —
 `be.get` / `be.post` are mocked, and the fixtures reproduce the response shapes
-of a real LiteLLM v1.100.1 proxy (the MCP fixtures, `tests/mcp_fixtures.py`:
+of a real LiteLLM v1.100.1 proxy (the MCP and guardrail fixtures, `tests/mcp_fixtures.py` and `tests/guardrail_fixtures.py`:
 v1.106.3, each factory citing the source function it reproduces).
 
 ## Layout
@@ -13,6 +13,7 @@ v1.106.3, each factory citing the source function it reproduces).
 | `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused), and `logs.latency_ms` / `logs.filter_logs` / `logs.normalize` / `logs.token_of` / `logs.key_alias_map` / `logs.summary` (shape tolerance, sha256 vs alias vs ambiguous-alias key references, per-field filters, percentiles, per-model breakdown), and `tags.parse_tags` / `tags.as_metadata` / `tags.key_tags` / `tags.log_row_tags` / `tags.filter_by_tags` / `tags.spend_by_tag` (tag parsing and emptiness refusal, metadata merge, `metadata.tags` vs flat `tags` vs the JSON-text `request_tags` column, per-row tag filters, the several-tags-per-request aggregation with `(untagged)`), and `usage.window` / `usage.params` / `usage.as_rows` / `usage.normalize` / `usage.totals` (window construction and validation, dimension→`group_by` mapping, envelope tolerance, sha256-named key rows with the recorded alias winning, the `day` client-side summation, roll-ups). |
 | `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow, and the tag set (`keys generate --tags` / `keys update --tags` with metadata merge and empty-refusal, `keys list` tags column, `spend --by tag`, `logs list --tag` / `logs summary --tag`, and the tag-chargeback workflow: generate→spend→logs→retag), and the usage-report set (`usage report`: `--days` and explicit `--start/--end` query construction, range validation before the proxy, `--json` shape, `--by api_key` naming through the live key list with no hash in the output, `--limit`, the junk-row tolerance) plus the money-view workflow (`spend --by key` and `usage report --by api_key` name the same caller the same way and agree on the total; `logs list --key` is the drill-down). |
 | `tests/test_mcp.py` | MCP gateway (v0.10.0): `core/mcp.py` units (envelope tolerance, labels, URL-origin redaction, server redaction never carrying a secret, row normalisation, id/alias/name resolution with ambiguity refused, POST/PUT body construction and every client-side refusal, env-sourced secrets, dry-run masking, tool→server attribution, key grants, effective reach, grant validation, stale grants, path escaping), `backend.put/delete`, the `mcp` command set over the mocked proxy, `keys generate|update --mcp-*`, `keys list` `mcp` field, `keys rotate` carrying the grant, two workflows, and subprocess tests of the installed command (`_resolve_cli`: help, a dry-run that never leaks the env secret, a loud failure on an unreachable proxy). |
+| `tests/test_guardrails.py` | Guardrails (v0.11.0): `core/guardrails.py` units (location, redaction that also hides the proxy's 4-character partial mask, row normalisation, id/name resolution with ambiguity refused, mode parsing, `--param` typing and literal-secret refusal, POST and PATCH bodies and every refusal, apply verdicts, usage windows, overview/log/submission rows), `backend.patch`, the `guardrails` command set over the mocked proxy, and two workflows. |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -246,7 +247,7 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/mcp_fixtures.py`):
   not filed under `ha`) and `--server` filters by id, alias or name.
 - `mcp groups` lists group members and `allow_all_keys` servers; `mcp access`
   computes groups ∪ named servers ∪ open servers per key, shows keys with
-  no grant as inherited, honours the `no-mcp-servers` sentinel, filters by
+  no grant as inherited only where a team, org or admin owner can grant (else `(none)`, since v0.11.0), honours the `no-mcp-servers` sentinel, filters by
   `--server`.
 - `mcp add`: `--dry-run` prints the body with the credential masked (`**** (from
   $VAR)`) and sends nothing; the real POST carries the secret and the printed
@@ -270,8 +271,51 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/mcp_fixtures.py`):
   names the stale grant; and incident triage: `mcp health` exit 2 →
   `mcp access --server <unhealthy>` names the affected keys.
 
+## Guardrail coverage (`guardrails ...`, v0.11.0: `core/guardrails.py`)
+
+Fixtures reproduce LiteLLM v1.106.3 (`tests/guardrail_fixtures.py`):
+
+| Fixture | Source (litellm/ in v1.106.3) |
+|---|---|
+| `guardrail()` / `GUARDS` / `V2_LIST` | `GuardrailInfoResponse` / `ListGuardrailsResponse` (`types/guardrails.py`) as `list_guardrails_v2` and `get_guardrail_info` (`proxy/guardrails/guardrail_endpoints.py`) build them, masked by `get_masked_values` (`litellm_core_utils/litellm_logging.py`, reproduced by `proxy_mask`) |
+| `V1_LIST` | `list_guardrails` → `_get_guardrails_list_response` (config.yaml only) |
+| `created()` | `create_guardrail` → `GuardrailRegistry.add_guardrail_to_db` (`proxy/guardrails/guardrail_registry.py`): the request plus `guardrail_id`, unmasked |
+| `deleted()` | `delete_guardrail_from_db`: `{"message": "Guardrail <id> deleted successfully"}` |
+| `OVERVIEW` / `EMPTY_OVERVIEW` | `UsageOverviewResponse` / `_EMPTY_OVERVIEW` (`proxy/guardrails/usage_endpoints.py`, `guardrails_usage_overview`) |
+| `DETAIL` | `UsageDetailResponse` (`guardrails_usage_detail`) |
+| `LOGS` / `log_entry()` | `UsageLogsResponse` / `UsageLogEntry` (`guardrails_usage_logs`, `_usage_log_entry_from_row`) |
+| `SUBMISSIONS` / `APPROVED` | `ListGuardrailSubmissionsResponse` (`list_guardrail_submissions`, `_row_to_submission_item`), `approve_guardrail_submission` |
+
+- `guardrails list` is unchanged (config only); `--all` reads
+  `/v2/guardrails/list` and tags rows `SRC=config|db`. No fixture secret (key,
+  URL query) reaches any output, including the unmasked echo from `add`.
+- `guardrails add`: dry-run prints the exact body and sends nothing. Refused
+  before the proxy: a literal `--api-key`, a secret-named literal `--param`,
+  bad modes.
+- `guardrails update` PATCHes only the given fields (`default_on` inside
+  `litellm_params`). A changed `mode`/integration is refused, as are config
+  guardrails and "nothing to update".
+- `guardrails delete`: dry-run, `--yes` gating, config refusal, keys whose
+  metadata still lists the guardrail.
+- `guardrails test`: passed / modified / blocked (exit 3, from a 4xx). Text can
+  come from stdin. 404 and 401 are errors, not verdicts.
+- `guardrails usage`: window params, exit 2 on `critical`, the empty overview,
+  the per-guardrail detail by name, and the >366-day refusal before the proxy.
+- `guardrails logs`: guardrail id, page size and action passed through. The
+  `--limit` bound is checked, and snippets only appear with `--snippets`.
+- `guardrails submissions/approve/reject`: redacted listing, approve gated by
+  `--yes` and dry-runnable, reject ungated.
+- Workflows: add (dry-run first) → test (blocked) → usage (critical) → turn
+  `default_on` off → delete; and team review: submissions → approve → visible
+  in `list --all`.
+- MCP reviewer pin (`tests/test_mcp.py`): a team-less, org-less key whose
+  owner is not an admin shows `(none)` / `reaches: []`. It still reaches
+  `allow_all_keys` servers. Team, org and admin-owner keys show
+  `(inherited: …)` with `inherits_from`. An unreadable user list assumes no
+  admin. `users list` falls back to v1.106.3's `/user/list`.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 262 passed, 90.3% coverage (v0.10.0; `core/mcp.py` 97%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, as are the new `tests/test_mcp.py` and `tests/mcp_fixtures.py`; a repo-wide `ruff check .` still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 310 passed, 92% coverage (v0.11.0; `core/guardrails.py` 99%, `core/mcp.py` 97%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, as are `tests/test_mcp.py`, `tests/mcp_fixtures.py`, `tests/test_guardrails.py` and `tests/guardrail_fixtures.py`; a repo-wide `ruff check .` still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
 
-(v0.9.0: 190 passed, 87.9% coverage.)
+(v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)
