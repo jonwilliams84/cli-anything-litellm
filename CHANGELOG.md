@@ -1,5 +1,85 @@
 # Changelog
 
+## [0.12.0] — 2026-10-25
+
+Routing resilience: fallbacks, paused deployments and recorded health.
+
+When a backend misbehaves, an operator wants three things: to see it without
+sending every backend a paid request, to take the bad replica out of rotation
+without deleting it, and to know the group will fail over to something else.
+The CLI could only run `health` (a real completion to every deployment) and
+`models delete`. It had no command for fallbacks at all, and `drift` ignored
+them, so a fallback rule added through the API or the Admin UI lived in the
+database and never showed up anywhere. Now (shapes from v1.106.3):
+
+- **`fallbacks list [--model M] [--type T]`**: every rule in the three lists
+  (`general`, `context_window`, `content_policy`), from `GET /router/settings`,
+  with who owns it (`SRC=config|db`).
+- **`fallbacks show <model> [--type T]`**: the chain the router would actually
+  use (`GET /fallback/{model}`: the model's own rule, then a provider-prefixed
+  match, then the `*` catch-all).
+- **`fallbacks set <model> --to a,b [--type T]`** (`POST /fallback`): every
+  name is checked against the live model groups first. The output names the
+  chain it replaced.
+  **`fallbacks delete <model> --yes`** (`DELETE /fallback/{model}`): the output
+  says whether a `*` rule still covers the model.
+  Both refuse a list that config.yaml sets. The config owns those lists
+  (`config_ownership_message`, `config_resolvers/settings_store.py`), so the
+  proxy would change only the worker that answered, keep reporting the config
+  value, and lose the change on restart.
+- **`fallbacks test <model> [--type T]`**: fails the primary on purpose with
+  the router's own `mock_testing_*fallbacks` flag
+  (`Router._handle_mock_testing_fallbacks`) and reports which group served,
+  from the `x-litellm-model-id` header. Verdicts are `failed_over` (exit 0),
+  or `chain_failed`, `not_triggered` or `unknown` (exit 2). It is one real
+  completion, logged and billed. 401/403 stay errors.
+- **`models block <id>` / `models unblock <id>`** (`POST /model/block|unblock`,
+  `_set_model_blocked_status`): pauses one DB deployment, which stays in place
+  but gets no traffic. A group name is refused, because pausing every replica
+  is an outage. Config deployments are refused too: the proxy answers 400 for
+  them. `block` is `--yes`-gated and its confirmation says how many replicas
+  keep serving, or that this is the last one. Both are idempotent.
+  `models list` gains a PAUSED column (`blocked` / `blocked_replicas` in
+  `--json`).
+- **`health latest [--unhealthy]`**: the last recorded status of every
+  deployment (`GET /health/latest`). No backend is called. Rows are joined to
+  the live deployments: `gone` (the row outlived its deployment), `blocked`,
+  and `unknown` for a deployment never checked. Exit 2 when a live, unpaused
+  deployment is unhealthy.
+- **`health history [--model M] [--status S] [--limit ≤1000] [--offset N]`**
+  (`GET /health/history`): recorded checks, newest first. Background checks
+  record only status changes (`save_background_health_checks_to_db`), so this
+  is the "when did it go down" log. A limit outside 1..1000 is refused before
+  the proxy is called.
+- **`drift` and `fleet diff` compare fallback chains**, rule by rule (the
+  order of rules doesn't matter, the order within a chain does). A rule that
+  exists only on the live side, the kind `POST /fallback` writes, counts as
+  drift. Before this, fallbacks were not compared at all. `router show` now
+  includes the three lists.
+
+`health` is now a group. Plain `health [--model M]` is unchanged and still
+sends real requests.
+
+### Security
+- Health errors (`error_message`) are upstream exception text, which can quote
+  a backend URL carrying a key or echo part of an API key. Every health and
+  `fallbacks test` output cuts URLs to their origin and masks key-shaped
+  tokens. `/model/block|unblock` reply with the DB row, `litellm_params`
+  included; the CLI prints only id, group, blocked and the replica count.
+
+### Fixed (docs)
+- The SKILL listed `teams unblock` as `--yes`-gated (it is not), and its "Wide
+  windows do not download" trap had drifted below the policy-file section.
+
+Core: `core/fallbacks.py`, `core/health.py`. `core/models.py` gains
+`is_blocked` / `serving_replicas` / `resolve_deployment`, `core/drift.py`
+compares fallback chains, and `core/backend.py` can return response headers
+(`response_headers=`). Tests: `tests/test_resilience.py` (core units, the CLI
+over the mocked proxy, drift/fleet, two workflows, the installed command via
+`_resolve_cli`), with fixtures in `tests/resilience_fixtures.py`, each citing
+the v1.106.3 function it reproduces. Docs: README, `TEST.md`, `CLAUDE.md` and
+the SKILL (both copies). (v0.12.0: 366 tests, 94% coverage.)
+
 ## [0.11.0] — 2026-10-25
 
 Guardrails: from "which ones are loaded" to managing, testing and measuring them.

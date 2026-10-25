@@ -4,7 +4,7 @@ Click CLI over the LiteLLM proxy admin API. It is an HTTP client only: it never 
 
 ## Layout
 - `cli_anything/litellm/litellm_cli.py`: every command. Live readers (`live_deployments`, `live_router`, `live_guardrails`, `readiness`) are shared by `drift` and `fleet`.
-- `core/backend.py`: transport and auth (flags > `LITELLM_URL`/`LITELLM_API_KEY` > `~/.cli-anything/litellm/config.json`), raising `ApiError(status, message, url)`.
+- `core/backend.py`: transport and auth (flags > `LITELLM_URL`/`LITELLM_API_KEY` > `~/.cli-anything/litellm/config.json`), raising `ApiError(status, message, url)`; `response_headers={}` collects the reply headers (`x-litellm-*`).
 - `core/models.py`: the deployment fingerprint, grouping and replica consistency.
 - `core/teams.py`: `/team/*` mutation bodies and id-or-alias resolution.
 - `core/users.py`: `/user/*` mutation bodies and id-or-email resolution.
@@ -16,13 +16,15 @@ Click CLI over the LiteLLM proxy admin API. It is an HTTP client only: it never 
 - `core/tags.py`: keys carry `--tags` (stored as `metadata.tags`), `spend --by tag` bills per tag from the spend log's JSON-text `request_tags` column (several tags ride on one request; `(untagged)` for none), and `logs --tag` drills down.
 - `core/mcp.py`: the MCP gateway (`/v1/mcp/*`): server rows, redaction (URL origin only, header/env values masked, credentials by field name — upstream keys hide in all of them), name/id resolution, POST/PUT bodies (PUT is partial: unset flags are omitted, never nulled), tool → server attribution, and keys' MCP grants from `object_permission` (merged per field by the proxy; `keys rotate` copies the grant, never the row id).
 - `core/guardrails.py`: guardrail management (`/guardrails*`, `/v2/guardrails/list`, `/guardrails/usage/*`, submissions): config vs DB location, redaction (secret-named values fully masked — the proxy's own mask keeps 4 characters — and URLs cut to their origin), POST and PATCH bodies (never PUT: reads are masked; `default_on` goes inside `litellm_params`), `--param` typing and literal-secret refusal, usage windows (≤366 days), the apply_guardrail verdict.
+- `core/fallbacks.py`: router fallbacks (`/router/settings`, `/fallback*`): the three lists, stored-shape tolerance, config ownership (a list config.yaml sets is refused for `set`/`delete`: the proxy would change one worker until restart), the POST body and its refusals, the `drift`/`fleet` chain comparison, and the `fallbacks test` mock-failure probe and verdict (`x-litellm-model-id` → group).
+- `core/health.py`: recorded health (`/health/latest`, `/health/history`): rows joined to live deployments (gone/blocked/unknown), history bounds, and `redact_error` (upstream error text can carry URLs and keys). `models block|unblock` helpers live in `core/models.py`.
 - `core/lint.py`: built-in rules and the policy engine (operators are documented in the module docstring).
 - `skills/cli-anything-litellm/SKILL.md` is the agent skill. `cli_anything/litellm/skills/SKILL.md` is a copy of it: keep them identical.
 
 ## Test
 `pip install -e '.[dev]' && pytest && ruff check . && ruff format --check .`
 
-Tests are offline. The fixtures reproduce response shapes seen on a real v1.100.1 proxy; the MCP and guardrail fixtures (`tests/mcp_fixtures.py`, `tests/guardrail_fixtures.py`) reproduce v1.106.3 and cite the source function of each shape. When a live proxy behaves differently, capture the shape into a test before changing code.
+Tests are offline. The fixtures reproduce response shapes seen on a real v1.100.1 proxy; the MCP, guardrail and resilience fixtures (`tests/mcp_fixtures.py`, `tests/guardrail_fixtures.py`, `tests/resilience_fixtures.py`) reproduce v1.106.3 and cite the source function of each shape. When a live proxy behaves differently, capture the shape into a test before changing code.
 
 ## Rules
 - Never echo secrets. `lint` masks anything secret-looking, and `config show` truncates the key.

@@ -2,7 +2,10 @@
 name: cli-anything-litellm
 description: >-
   Administer, tune and audit a LiteLLM proxy from the shell: model groups and
-  replicas, live router settings, guardrails, virtual keys (create, limit,
+  replicas, live router settings, routing resilience (fallback chains: list,
+  set, delete, and test a chain by failing a group on purpose; pause/unpause
+  one DB deployment; recorded health — the proxy's own checks, latest and
+  history, without calling any backend), guardrails, virtual keys (create, limit,
   tag, block, rotate, delete), user accounts (create, update, delete), teams
   (create, update, members, block, delete), budgets (reusable spend caps keys
   reference by budget_id: create, update, delete), customers (end users of the
@@ -22,7 +25,7 @@ description: >-
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
-  exist only in its database), differences between proxies behind one VIP (the
+  exist only in its database, and fallback rules set through the API), differences between proxies behind one VIP (the
   mismatched-master-key 401 class), and lints a config against built-in hygiene
   rules plus a site POLICY file of recorded decisions. Use before and after any
   LiteLLM change, and whenever inference "got slow" or clients see 401s.
@@ -52,6 +55,12 @@ cli-anything-litellm config test                  # reachability + auth + versio
 |---|---|
 | Is it up? Which version, DB, cache, callbacks? | `status` |
 | Are the backends answering? | `health [--model M]` — sends a REAL request to every deployment |
+| What did the proxy's own health checks last see? (free) | `health latest [--unhealthy]` — no backend called; `gone` = row outlived its deployment, `blocked` = paused, `unknown` = never checked; exit 2 if a live, unpaused deployment is unhealthy |
+| When did a backend go down / come back? | `health history [--model GROUP] [--status unhealthy] [--limit ≤1000] [--offset N]` — background checks record status CHANGES only |
+| Take one bad replica out of rotation (reversibly) | `models block <deployment-id> --yes` (DB deployments only; says how many replicas keep serving), `models unblock <id>`; `models list --deployments` shows PAUSED |
+| What happens when a group fails? | `fallbacks list [--model M] [--type general|context_window|content_policy]` (`SRC=config|db`), `fallbacks show <model>` (the effective chain, `*` catch-all included) |
+| Add / change / remove a fallback rule | `fallbacks set <model> --to a,b [--type T]`, `fallbacks delete <model> --yes` — refused when config.yaml owns that list |
+| Does the fallback chain actually serve? | `fallbacks test <model> [--type T]` — fails the primary on purpose (the router's mock flag); `failed_over` (exit 0) / `chain_failed` / `not_triggered` / `unknown` (exit 2). One REAL completion, logged and billed |
 | What models/replicas does it serve? | `models list` (`--deployments` for one row per replica; `SRC=db` = added via UI/API) |
 | Are replicas of one group interchangeable? | `models consistency` |
 | What is the router actually doing? | `router show` (`--all` for every field) |
@@ -76,7 +85,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Teams: list / inspect | `teams list`, `teams info <team_id>` |
 | Teams: create / change | `teams create --alias A --team-id T [--models m1,m2] [--max-budget 50] [--member U|--member E]`, `teams update <team_id|alias> --models m1,m2 [--max-budget N]` |
 | Teams: add / remove a member | `teams member-add <team_id|alias> --user U-or-E [--role admin|user]`, `teams member-delete <team_id|alias> --user U-or-E` |
-| Teams: stop / restore / remove | `teams block <team_id|alias> --yes`, `teams unblock <team_id|alias> --yes`, `teams delete <team_id|alias> --yes` (also deletes every key minted for the team) |
+| Teams: stop / restore / remove | `teams block <team_id|alias> --yes`, `teams unblock <team_id|alias>`, `teams delete <team_id|alias> --yes` (also deletes every key minted for the team) |
 | User accounts: list / inspect | `users list [--role R] [--team T]`, `users info <user_id|email>` (also lists the user's keys) |
 | User accounts: create | `users create --user-id U [--email E] [--role proxy_admin_viewer] [--teams a,b] [--max-budget 5]` — never mints a key; issue one with `keys generate --user U` |
 | User accounts: change / remove | `users update U --teams a,b [--role R] [--max-budget N]`, `users delete U --yes` (also invalidates every key the user owns — run `users info` first) |
@@ -95,15 +104,15 @@ cli-anything-litellm config test                  # reachability + auth + versio
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 `users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
-`mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve` need `--yes`
-when there is no TTY.
+`mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve`,
+`models block`, `fallbacks delete` need `--yes` when there is no TTY.
 
 ## Workflow for any change
 
 1. `lint --config <new config> --policy <site policy>` — before deploying.
 2. Deploy the way the estate deploys (never via this tool).
 3. `drift --config <same file>` against **every** node, then `fleet diff`.
-4. `health` if backends changed.
+4. `health latest` (free), or `health` if backends changed and you accept a real request each.
 
 ## Traps this tool already handles (don't rediscover them)
 
@@ -138,7 +147,8 @@ when there is no TTY.
   (`svc (gone)` for renamed, rotated or deleted keys). The window filter is
   server-side (`--days`); key/user/team/model filters are applied client-side.
 - **`health` is not free.** It sends a completion to every deployment. On a
-  metered upstream that costs money; on local vLLM it adds load.
+  metered upstream that costs money; on local vLLM it adds load. `health
+  latest` / `health history` read the proxy's recorded checks instead.
 - **`teams delete` deletes every key minted for the team**, exactly like
   `users delete` invalidates a user's keys — the confirmation names them, so
   check `keys list --team <team_id>` before deleting. Blocking a team fails all
@@ -242,13 +252,28 @@ when there is no TTY.
   `allow_all_keys` servers). Owner roles come from the user list; if that
   cannot be read, no admin role is assumed.
 
-## Site policy files
-
-`lint --help-policy` prints the format. A policy turns decisions an estate has
-recorded (ADRs, runbooks) into checks, so an agent tuning the proxy cannot
-quietly undo one: routing strategy, required pre-call checks, required
-guardrails, advertised context per deployment, secrets from env. Keep the policy
-file next to the config it governs, in the same repo.
+- **Fallback lists have an owner.** A list config.yaml sets (`SRC=config`)
+  is owned by the config: the proxy ignores the DB copy, so `POST /fallback`
+  would change only the worker that answered, `/router/settings` would keep
+  showing the config value, and a restart drops it. `fallbacks set|delete`
+  refuse those; edit the config. Lists the config does not set are DB-owned
+  (needs `STORE_MODEL_IN_DB`) and survive restarts, but are not in git:
+  `drift` reports each rule as `fallbacks.<model>` until the config says the
+  same. Chains are compared rule by rule; order inside a chain matters.
+- **`fallbacks test` costs one request.** It sends a chat completion with
+  `mock_testing_fallbacks` (or the context-window / content-policy variant),
+  so the primary is failed without touching it and a fallback answers. The
+  serving group comes from `x-litellm-model-id`. Chat groups only.
+- **Paused, not deleted.** `models block` sets the DB row's `blocked` flag:
+  the router skips the deployment, every setting stays, `models unblock`
+  restores it. The proxy pauses DB deployments only, and the CLI takes one
+  deployment id at a time (a group name is refused — pausing every replica is
+  an outage). The reply is the DB row with `litellm_params`; it is never echoed.
+- **Recorded health is a transition log.** Background health checks write a
+  row only when a deployment's status changes; manual `/health` calls write
+  one each time. So `health latest`'s SINCE is when the status began, and rows
+  of deleted deployments linger (`gone`). Error text is upstream exception
+  text: URLs are cut to their origin and key-shaped tokens masked.
 - **Wide windows do not download.** `spend --days 90` and `logs summary` pull
   every raw row in the window and aggregate client-side — slow and heavy on a
   busy proxy. `usage report` asks the proxy's own aggregation
@@ -258,3 +283,11 @@ file next to the config it governs, in the same repo.
   `logs list`. The report's `api_key` rows are sha256 hashes, named the same
   way `spend --by key` names callers; `--by day` is summed client-side (the
   endpoint has no day-only form), so it is still a single small response.
+
+## Site policy files
+
+`lint --help-policy` prints the format. A policy turns decisions an estate has
+recorded (ADRs, runbooks) into checks, so an agent tuning the proxy cannot
+quietly undo one: routing strategy, required pre-call checks, required
+guardrails, advertised context per deployment, secrets from env. Keep the policy
+file next to the config it governs, in the same repo.

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from cli_anything.litellm.core import fallbacks as fb
 from cli_anything.litellm.core import models as m
 
 # router_settings keys whose live value is reported by /router/settings.
@@ -108,7 +109,9 @@ def compare_router(cfg_router: dict[str, Any], live_values: dict[str, Any]) -> l
             except (TypeError, ValueError):
                 pass
             out.append({"key": k, "config": v, "live": lv})
-    return out
+    # Fallback chains rule by rule, including rules only the live side has
+    # (POST /fallback writes them to the DB, never to git).
+    return out + fb.chain_drift(cfg_router or {}, live_values or {})
 
 
 def _guardrail_view(g: dict[str, Any]) -> dict[str, Any]:
@@ -194,7 +197,9 @@ def fleet_diff(snapshots: dict[str, dict[str, Any]]) -> dict[str, Any]:
             continue
         r = snapshots[ref_url]
         dep = compare_deployments(r["deployments"], s["deployments"])
-        router = compare_router({k: v for k, v in r["router"].items() if k in ROUTER_KEYS}, s["router"])
+        router = compare_router(
+            {k: v for k, v in r["router"].items() if k in ROUTER_KEYS or k in fb.FIELDS.values()}, s["router"]
+        )
         guard = compare_guardrails(r["guardrails"], s["guardrails"])
         results.append(
             {

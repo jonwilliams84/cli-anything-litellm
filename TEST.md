@@ -2,8 +2,9 @@
 
 All tests are offline: `pip install -e '.[dev]' && pytest`. No proxy is needed —
 `be.get` / `be.post` are mocked, and the fixtures reproduce the response shapes
-of a real LiteLLM v1.100.1 proxy (the MCP and guardrail fixtures, `tests/mcp_fixtures.py` and `tests/guardrail_fixtures.py`:
-v1.106.3, each factory citing the source function it reproduces).
+of a real LiteLLM v1.100.1 proxy (the MCP, guardrail and resilience fixtures, `tests/mcp_fixtures.py`,
+`tests/guardrail_fixtures.py` and `tests/resilience_fixtures.py`: v1.106.3, each factory citing the source
+function it reproduces).
 
 ## Layout
 
@@ -14,6 +15,7 @@ v1.106.3, each factory citing the source function it reproduces).
 | `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow, and the tag set (`keys generate --tags` / `keys update --tags` with metadata merge and empty-refusal, `keys list` tags column, `spend --by tag`, `logs list --tag` / `logs summary --tag`, and the tag-chargeback workflow: generate→spend→logs→retag), and the usage-report set (`usage report`: `--days` and explicit `--start/--end` query construction, range validation before the proxy, `--json` shape, `--by api_key` naming through the live key list with no hash in the output, `--limit`, the junk-row tolerance) plus the money-view workflow (`spend --by key` and `usage report --by api_key` name the same caller the same way and agree on the total; `logs list --key` is the drill-down). |
 | `tests/test_mcp.py` | MCP gateway (v0.10.0): `core/mcp.py` units (envelope tolerance, labels, URL-origin redaction, server redaction never carrying a secret, row normalisation, id/alias/name resolution with ambiguity refused, POST/PUT body construction and every client-side refusal, env-sourced secrets, dry-run masking, tool→server attribution, key grants, effective reach, grant validation, stale grants, path escaping), `backend.put/delete`, the `mcp` command set over the mocked proxy, `keys generate|update --mcp-*`, `keys list` `mcp` field, `keys rotate` carrying the grant, two workflows, and subprocess tests of the installed command (`_resolve_cli`: help, a dry-run that never leaks the env secret, a loud failure on an unreachable proxy). |
 | `tests/test_guardrails.py` | Guardrails (v0.11.0): `core/guardrails.py` units (location, redaction that also hides the proxy's 4-character partial mask, row normalisation, id/name resolution with ambiguity refused, mode parsing, `--param` typing and literal-secret refusal, POST and PATCH bodies and every refusal, apply verdicts, usage windows, overview/log/submission rows), `backend.patch`, the `guardrails` command set over the mocked proxy, and two workflows. |
+| `tests/test_resilience.py` | Routing resilience (v0.12.0): `core/fallbacks.py` units (every stored list shape, rows with owner, config ownership, POST body and refusals, chain drift, probe body and verdicts, path escaping), `core/health.py` units (error redaction, envelopes, rows, the latest/live join with gone/blocked/unknown, history bounds), the `core/models.py` block helpers, `backend` response headers, `drift`/`fleet` over fallback chains, the `health latest/history`, `models block/unblock`, `router show` and `fallbacks list/show/set/delete/test` commands over the mocked proxy, two workflows, and subprocess tests of the installed command (`_resolve_cli`). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -314,8 +316,48 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/guardrail_fixtures.py`):
   `(inherited: …)` with `inherits_from`. An unreadable user list assumes no
   admin. `users list` falls back to v1.106.3's `/user/list`.
 
+## Routing resilience coverage (`fallbacks ...`, `models block|unblock`, `health latest|history`, v0.12.0: `core/fallbacks.py`, `core/health.py`)
+
+- `health` with no subcommand still calls `GET /health` (`--model` passed
+  through). `--model` before a subcommand is a usage error.
+- `health latest`: calls `/health/latest` and `/v1/model/info`, never
+  `/health`. Exit 2 only for a live, unpaused unhealthy deployment: `gone`
+  rows (deleted deployments) and `blocked` rows don't fail it. A deployment
+  never checked shows as `unknown`. `--unhealthy` filters. No secret from the
+  upstream error reaches the output.
+- `health history`: `model`, `status_filter`, `limit`, `offset` passed
+  through, newest first, and a "more" hint when a page is full. A limit
+  outside 1..1000 is refused before the proxy is called.
+- `models list` shows PAUSED (`blocked`, `blocked_replicas`).
+- `models block`: dry-run prints the exact body, it refuses without `--yes`
+  off a TTY, and the confirmation names how many replicas keep serving (or
+  "LAST serving replica"). Group names, config deployments and unknown ids
+  are refused before the proxy. The DB row the proxy returns is never
+  echoed. A 403 surfaces.
+- `models unblock` is idempotent (no call when the deployment is already
+  unpaused) and ungated.
+- `fallbacks list`: rows from all three lists with `source`, filtered by
+  type or by model (own rule plus `*`). `router show` includes the lists.
+- `fallbacks show`: `GET /fallback/{model}` with `fallback_type`. A 404 means
+  "(none)"; any other error is an error.
+- `fallbacks set`: the exact dry-run body, the replaced chain in the output,
+  and refusals before the proxy for unknown groups, self-fallback and
+  config-owned lists. The proxy's `STORE_MODEL_IN_DB` 400 surfaces.
+- `fallbacks delete`: `--yes` gate, a dry-run with the query, the `*`
+  catch-all that still covers the model named, and unknown or config-owned
+  rules refused.
+- `fallbacks test`: the mock flag per type, `failed_over` (exit 0) from the
+  `x-litellm-model-id` header, `not_triggered` and `chain_failed` (exit 2,
+  error redacted), no chain → an error with no completion sent, 401 → an
+  error rather than a verdict, and dry-run sends nothing.
+- `drift` exits 2 on a DB-only fallback rule. `fleet diff` compares chains.
+- Workflows: a backend incident (`health latest` → `health history` →
+  `models block` → `fallbacks set` → `fallbacks test` → `health latest`
+  passes → `models unblock`), and a fallback set through the API showing as
+  drift until the config in git says the same.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 310 passed, 92% coverage (v0.11.0; `core/guardrails.py` 99%, `core/mcp.py` 97%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, as are `tests/test_mcp.py`, `tests/mcp_fixtures.py`, `tests/test_guardrails.py` and `tests/guardrail_fixtures.py`; a repo-wide `ruff check .` still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q`: 366 passed, 94% coverage (v0.12.0; `core/fallbacks.py` and `core/health.py` 100%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, and so are `tests/test_resilience.py` and `tests/resilience_fixtures.py`, along with the MCP and guardrail test files. A repo-wide `ruff check .` (ruff 0.17.2) still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
 
-(v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)
+(v0.11.0: 310 passed, 92%. v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)

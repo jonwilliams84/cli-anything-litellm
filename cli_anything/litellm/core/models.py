@@ -76,6 +76,49 @@ def is_db_model(dep: dict[str, Any]) -> bool:
     return bool((dep.get("model_info") or {}).get("db_model"))
 
 
+def is_blocked(dep: dict[str, Any]) -> bool:
+    """True when an admin paused the deployment (``POST /model/block``).
+
+    ``ProxyConfig.get_model_info_with_id`` copies ``LiteLLM_ProxyModelTable.blocked``
+    into ``model_info.blocked`` for DB deployments; the router skips them.
+    """
+    return (dep.get("model_info") or {}).get("blocked") is True
+
+
+def serving_replicas(deps: list[dict[str, Any]], model_name: str | None, excluding: str | None = None) -> int:
+    """Unpaused replicas of ``model_name``, not counting the deployment ``excluding``."""
+    return sum(
+        1
+        for d in deps
+        if d.get("model_name") == model_name
+        and not is_blocked(d)
+        and (excluding is None or dep_id(d) != excluding)
+    )
+
+
+def resolve_deployment(deps: list[dict[str, Any]], ref: str, verb: str = "block") -> dict[str, Any]:
+    """The ONE DB deployment ``models block|unblock`` may act on. Raises ``ValueError``.
+
+    A group name is refused (pausing every replica is an outage, done one id at
+    a time on purpose), and so is a config deployment: ``_set_model_blocked_status``
+    answers 400 "Cannot edit config-based model" for those.
+    """
+    d = next((x for x in deps if ref and dep_id(x) == ref), None)
+    if d is None:
+        ids = [dep_id(x) or "?" for x in deps if x.get("model_name") == ref]
+        if ids:
+            raise ValueError(
+                f"{ref!r} is a model group; `models {verb}` takes one deployment id: {', '.join(ids)}"
+            )
+        raise ValueError(f"no live deployment has id {ref!r} (see `models list --deployments`)")
+    if not is_db_model(d):
+        raise ValueError(
+            f"deployment {ref} comes from config.yaml: the proxy pauses only DB deployments "
+            "(change the config and redeploy instead)"
+        )
+    return d
+
+
 def group(deps: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
     for d in deps:
@@ -94,6 +137,7 @@ def summarize(deps: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "model_name": name,
                 "replicas": len(ds),
                 "db_replicas": sum(1 for d in ds if is_db_model(d)),
+                "blocked_replicas": sum(1 for d in ds if is_blocked(d)),
                 "mode": sorted({i.get("mode") or "chat" for i in info}),
                 "max_input_tokens": sorted({i.get("max_input_tokens") for i in info}, key=str),
                 "input_cost_per_token": sorted({i.get("input_cost_per_token") for i in info}, key=str),
