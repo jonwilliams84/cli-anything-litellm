@@ -2,8 +2,8 @@
 
 All tests are offline: `pip install -e '.[dev]' && pytest`. No proxy is needed —
 `be.get` / `be.post` are mocked, and the fixtures reproduce the response shapes
-of a real LiteLLM v1.100.1 proxy (the MCP, guardrail and resilience fixtures, `tests/mcp_fixtures.py`,
-`tests/guardrail_fixtures.py` and `tests/resilience_fixtures.py`: v1.106.3, each factory citing the source
+of a real LiteLLM v1.100.1 proxy (the MCP, guardrail, resilience and cache fixtures, `tests/mcp_fixtures.py`,
+`tests/guardrail_fixtures.py`, `tests/resilience_fixtures.py` and `tests/cache_fixtures.py`: v1.106.3, each factory citing the source
 function it reproduces).
 
 ## Layout
@@ -16,6 +16,7 @@ function it reproduces).
 | `tests/test_mcp.py` | MCP gateway (v0.10.0): `core/mcp.py` units (envelope tolerance, labels, URL-origin redaction, server redaction never carrying a secret, row normalisation, id/alias/name resolution with ambiguity refused, POST/PUT body construction and every client-side refusal, env-sourced secrets, dry-run masking, tool→server attribution, key grants, effective reach, grant validation, stale grants, path escaping), `backend.put/delete`, the `mcp` command set over the mocked proxy, `keys generate|update --mcp-*`, `keys list` `mcp` field, `keys rotate` carrying the grant, two workflows, and subprocess tests of the installed command (`_resolve_cli`: help, a dry-run that never leaks the env secret, a loud failure on an unreachable proxy). |
 | `tests/test_guardrails.py` | Guardrails (v0.11.0): `core/guardrails.py` units (location, redaction that also hides the proxy's 4-character partial mask, row normalisation, id/name resolution with ambiguity refused, mode parsing, `--param` typing and literal-secret refusal, POST and PATCH bodies and every refusal, apply verdicts, usage windows, overview/log/submission rows), `backend.patch`, the `guardrails` command set over the mocked proxy, and two workflows. |
 | `tests/test_resilience.py` | Routing resilience (v0.12.0): `core/fallbacks.py` units (every stored list shape, rows with owner, config ownership, POST body and refusals, chain drift, probe body and verdicts, path escaping), `core/health.py` units (error redaction, envelopes, rows, the latest/live join with gone/blocked/unknown, history bounds), the `core/models.py` block helpers, `backend` response headers, `drift`/`fleet` over fallback chains, the `health latest/history`, `models block/unblock`, `router show` and `fallbacks list/show/set/delete/test` commands over the mocked proxy, two workflows, and subprocess tests of the installed command (`_resolve_cli`). |
+| `tests/test_cache.py` | The response cache (v0.13.0): `core/cache.py` units (JSON-string ping params, redaction harder than the proxy's 4+4 mask, keyspace summary and hit rate, `--set` typing and every refusal, merge-over-current body with markers, the anti-replay `dropped_credentials`, the config-owned `empty_save` gate, delete-body key requirement), the `cache ping/info/settings/settings test/settings update/delete/flushall` commands over the mocked proxy (exit 2 on unhealthy ping and failed test, the wrapped 503/500 error shapes, the live-captured admin 401, `--yes` gates, dry-runs), three workflows (stale-response invalidation, re-pointing the cache with the credential warning, flushall after a prompt change), and subprocess tests of the installed command (`_resolve_cli`). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -369,8 +370,58 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/guardrail_fixtures.py`):
   passes → `models unblock`), and a fallback set through the API showing as
   drift until the config in git says the same.
 
+## Response-cache coverage (`cache ...`, v0.13.0: `core/cache.py`)
+
+None of the `/cache/*` shapes could be checked against a live proxy: every
+route of the family is proxy-admin (`route_checks._raise_admin_only_route_exception`)
+and the house key is not one — the live v1.106.3 proxy answered the 401
+`ADMIN_DENIED` body reproduced in the fixtures, which is the one live-captured
+shape. Everything else comes from the v1.106.3 source, cited per fixture.
+
+Fixtures reproduce LiteLLM v1.106.3 (`tests/cache_fixtures.py`):
+
+| Fixture | Source (litellm/ in v1.106.3) |
+|---|---|
+| `ping_redis()` / `ping_local()` / `ping_no_cache_text()` | `cache_ping` (`proxy/caching_routes.py`): `CachePingResponse` (`types/caching.py`) — `litellm_cache_params` is a JSON *string* of the masked `vars(litellm.cache)` (the facade holds type/ttl/namespace, not the connection); `health_check_cache_params` is `HealthCheckCacheParams` over the backend's vars (host/port live inside `redis_kwargs`); no cache → 503 `ProxyException` whose message is a `safe_dumps` string |
+| `proxy_mask()` | `SensitiveDataMasker.mask_value` (`litellm_core_utils/sensitive_data_masker.py`): 4+4 characters visible — what the proxy leaves of a credential; the CLI masks fully |
+| `redis_info()` | `cache_redis_info` (`proxy/caching_routes.py`): `num_clients` (-1 + placeholder when CLIENT LIST is restricted), client rows, and redis-py's `info()` dict with `dbN` keyspace entries |
+| `service_unhealthy_text()` / `cache_delete_failed_text()` | the handlers' `except Exception` wrapping: info/flushall re-raise every failure (their own inner HTTPExceptions included) as 503 `Service Unhealthy (<inner>)`; delete rewraps as 500 `Cache Delete Failed(<inner>)` |
+| `settings_response()` / `settings_updated()` | `get_cache_settings` / `update_cache_settings` (`proxy/management_endpoints/cache_settings_endpoints.py`): `CacheSettingsResponse` — `current_values` = decrypted DB row ⊕ REDIS_* env, url precedence applied, `redis_type` derived, credentials as `***REDACTED***` (`_redact_credentials`); `CacheSettingsField` metadata from `types/management_endpoints/cache_settings_endpoints.py` |
+| `cache_test_ok()` / `cache_test_failed()` / `cache_test_not_redis()` | `test_cache_connection` → `RedisCache.test_connection` (`caching/redis_cache.py`) — always HTTP 200 |
+| `admin_denied_body()` | the live-captured 401 body (house v1.106.3 proxy, 2026-10-25) |
+
+- `cache ping`: exit 0 with the params table (facade + backend, where the
+  connection lives); exit 2 on the 503 (no cache / unhealthy) with the
+  redacted error; a non-redis cache shows "no ping / no set". The admin 401
+  is an error, never a verdict. No fixture secret reaches any output.
+- `cache info`: the curated summary (version, memory, maxmemory policy,
+  hit rate, evictions, total keys summed over the keyspace) and the full
+  INFO + clients in `--json`; `CLIENT LIST` unavailability is flagged.
+- `cache settings`: the redacted current_values table; sentinel/cluster
+  `redis_type` derivation; url precedence (a stored url hides host/port).
+- `cache settings test`: the merged body (markers preserved for the proxy to
+  restore), exit 0 on success / 2 on failure, the not-redis message, dry-run
+  sends nothing, and refusals (no `--set`, bad `--set`, literal secret).
+- `cache settings update`: the merged POST body (nothing dropped, `redis_type`
+  never re-sent), the dry-run body, the anti-replay warning when a target
+  change drops the stored password (and its absence when a new credential
+  rides along), the `--yes` gate + refusal text when the proxy reports no
+  stored settings (config.yaml owns the cache), the STORE_MODEL_IN_DB 500, and
+  the live-target guard (settings naming another Redis than `cache ping`'s:
+  `show` warns, `update` refuses without `--set host=` or `--yes`, no check
+  when the ping 503s).
+- `cache delete`: dry-run body, `--yes` gate, multi-key body, and the
+  rewrapped 500 error text. `cache flushall`: dry-run, `--yes` gate, and
+  the wrapped 503 shapes.
+- Workflows: stale-response invalidation (ping → info → settings → delete);
+  re-pointing the cache (test with credentials → update → the warning when
+  the credential is missing); flushall after a prompt change.
+- Subprocess (`_resolve_cli`): `cache --help` lists every verb, an
+  unreachable proxy fails loudly, and a literal `--set password` is refused
+  with the `os.environ/NAME` pointer without any proxy contact.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q`: 374 passed, 94% coverage (v0.12.0; `core/fallbacks.py` 99%, `core/health.py` 100%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, and so are `tests/test_resilience.py` and `tests/resilience_fixtures.py`, along with the MCP and guardrail test files. A repo-wide `ruff check .` (ruff 0.17.2) still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q`: 428 passed, 94% coverage (v0.13.0; the cache units, commands and workflows in `tests/test_cache.py` — 54 tests, `core/cache.py` 100%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, and so are `tests/test_cache.py` and `tests/cache_fixtures.py`, along with the MCP, guardrail and resilience test files. A repo-wide `ruff check .` (ruff 0.17.2) still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
 
-(v0.11.0: 310 passed, 92%. v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)
+(v0.12.0: 374 passed, 94% coverage. v0.11.0: 310 passed, 92%. v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)

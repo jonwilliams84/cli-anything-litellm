@@ -6,6 +6,7 @@ Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete — tagged for chargeback), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend, spend-by-tag.
 - **Routing resilience:** fallback chains (list, show the effective chain — resolved from router settings for group names with `/`, which the proxy's `/fallback/{model}` route cannot match — set, delete, and `fallbacks test` — fail a group on purpose and see which fallback served), and pausing one DB deployment without deleting it (`models block` / `models unblock`). Fallback lists config.yaml owns are refused (the proxy would drop the change on restart).
 - **MCP gateway:** the MCP servers the proxy fronts — list, health, tools, access groups, add/update/delete DB servers, live gateway sessions — and which keys reach which servers (`mcp access`, `keys generate|update --mcp-groups/--mcp-servers`). Secrets embedded in server URLs, headers and env are never printed.
+- **Response cache:** the Redis (or local) cache that serves repeated prompts without hitting the backend — `cache ping` (alive? what is it? — also writes a test entry, exit 2 down), `cache info` (memory, hit rate, evictions, keyspace of the Redis under it), `cache settings` (the DB row + REDIS_* env the proxy reports, credentials redacted), `cache settings test` (try new credentials without saving), `cache settings update` (merge changes over the effective settings — warns when a connection-target change makes the proxy drop the stored credential, and refuses to carry over a target that isn't the live cache's), `cache delete` (invalidate the keys a response's `x-litellm-cache-key` header names) and `cache flushall` (drop everything). Secrets ride as `os.environ/NAME` refs, never argv.
 - **Guardrails:** config and DB guardrails side by side, add/update/delete DB guardrails (PATCH only, secrets as `os.environ/` refs), `guardrails test` a text against one, usage and fail rates per guardrail, the requests a guardrail judged, and the team submission queue.
 - **Report (server-side):** `usage report` reads `/global/spend/report`, the proxy's own DB aggregation behind the Admin UI's charts — spend and token totals per day, team, key, model or end user over a window you can make as wide as a quarter (`--start/--end`), without downloading the log.
 - **Audit:**
@@ -57,6 +58,13 @@ cli-anything-litellm models block qwen-b --yes              # pause one DB repli
 cli-anything-litellm fallbacks set qwen --to gpt-4o,claude  # checked against live groups; refused if config.yaml owns the list
 cli-anything-litellm fallbacks test qwen                    # fail qwen on purpose: which fallback served? (one real completion)
 cli-anything-litellm models unblock qwen-b                  # back into rotation
+cli-anything-litellm cache ping                              # alive? what cache? (writes a test entry; exit 2 if down)
+cli-anything-litellm cache info                              # the Redis under it: memory, hit rate, evictions, keyspace
+cli-anything-litellm cache settings                          # the stored settings (DB row + REDIS_* env; credentials redacted)
+cli-anything-litellm cache settings test --set host=r2 --set password=os.environ/R2_PASS   # try, never save
+cli-anything-litellm cache settings update --set ttl=300     # merge over the effective settings; --yes pins a row over config.yaml's cache
+cli-anything-litellm cache delete litellm_proxy:abc --yes   # invalidate one stale response (its x-litellm-cache-key)
+cli-anything-litellm cache flushall --yes                    # every cached response gone; backends serve the next requests
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000
@@ -64,4 +72,4 @@ cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:400
 
 See [`skills/cli-anything-litellm/SKILL.md`](skills/cli-anything-litellm/SKILL.md) for the command map and the proxy behaviours it accounts for.
 
-Tested against LiteLLM **v1.100.1**; the MCP (v0.10.0), guardrail (v0.11.0) and routing-resilience (v0.12.0) commands against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.
+Tested against LiteLLM **v1.100.1**; the MCP (v0.10.0), guardrail (v0.11.0), routing-resilience (v0.12.0) and response-cache (v0.13.0) commands against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.
