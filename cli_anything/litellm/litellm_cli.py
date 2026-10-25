@@ -23,6 +23,7 @@ from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import logs as logs_mod
+from cli_anything.litellm.core import mcp as mcp_mod
 from cli_anything.litellm.core import models as models_mod
 from cli_anything.litellm.core import tags as tags_mod
 from cli_anything.litellm.core import teams as teams_mod
@@ -484,6 +485,7 @@ def _key_row(k: dict) -> dict:
         "token": k.get("token"),
         "tags": ", ".join(tags_mod.key_tags(k))
         or None,  # metadata.tags (the proxy flat-maps `tags` on older shapes)
+        "mcp": mcp_mod.key_mcp(k),  # object_permission's MCP grant (see `mcp access`)
     }
 
 
@@ -525,6 +527,19 @@ def _resolve_token(conn, key_or_alias: str) -> str:
     return hits[0]["token"]
 
 
+def _mcp_grant(ctx, groups_raw: str | None, servers_raw: str | None) -> dict[str, Any] | None:
+    """object_permission for --mcp-groups/--mcp-servers, validated against the live proxy."""
+    if groups_raw is None and servers_raw is None:
+        return None
+    c = _conn(ctx)
+    servers = _call(all_mcp_servers, c) if servers_raw is not None else []
+    groups = _call(mcp_groups, c) if groups_raw is not None else []
+    try:
+        return mcp_mod.grant_permission(servers, groups, groups_raw, servers_raw)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+
 @keys_grp.command("generate")
 @click.option("--alias", required=True)
 @click.option("--team", default=None)
@@ -540,8 +555,20 @@ def _resolve_token(conn, key_or_alias: str) -> str:
     default=None,
     help="Comma-separated tags, e.g. feat-x,team-a — the labels `spend --by tag` bills by.",
 )
+@click.option(
+    "--mcp-groups",
+    default=None,
+    help="Comma-separated MCP access groups the key may use (`mcp groups`); '' clears.",
+)
+@click.option(
+    "--mcp-servers",
+    default=None,
+    help="Comma-separated MCP servers (id, alias or name; `mcp list`); 'none' = no MCP at all.",
+)
 @click.pass_context
-def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_id, rpm, tpm, tags):
+def keys_generate(
+    ctx, alias, team, user, models, duration, max_budget, budget_id, rpm, tpm, tags, mcp_groups, mcp_servers
+):
     body = {
         k: v
         for k, v in {
@@ -562,6 +589,9 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_i
             body["metadata"] = tags_mod.as_metadata(None, tags_mod.parse_tags(tags))
         except ValueError as e:
             raise click.ClickException(str(e)) from e
+    perm = _mcp_grant(ctx, mcp_groups, mcp_servers)
+    if perm is not None:
+        body["object_permission"] = perm
     if _dry(ctx, "POST", "/key/generate", body):
         return
     res = _call(be.post, _conn(ctx), "/key/generate", body)
@@ -581,8 +611,20 @@ def keys_generate(ctx, alias, team, user, models, duration, max_budget, budget_i
     default=None,
     help="Comma-separated tags, e.g. feat-x,team-a (replaces the tag set; other metadata is kept).",
 )
+@click.option(
+    "--mcp-groups",
+    default=None,
+    help="Comma-separated MCP access groups the key may use (`mcp groups`); '' clears.",
+)
+@click.option(
+    "--mcp-servers",
+    default=None,
+    help="Comma-separated MCP servers (id, alias or name; `mcp list`); 'none' = no MCP at all.",
+)
 @click.pass_context
-def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, duration, tags):
+def keys_update(
+    ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, duration, tags, mcp_groups, mcp_servers
+):
     c = _conn(ctx)
     body = {
         k: v
@@ -602,6 +644,11 @@ def keys_update(ctx, key_or_alias, models, max_budget, budget_id, rpm, tpm, dura
             want_tags = tags_mod.parse_tags(tags)
         except ValueError as e:
             raise click.ClickException(str(e)) from e
+    perm = _mcp_grant(ctx, mcp_groups, mcp_servers)
+    if perm is not None:
+        # The proxy merges object_permission per field, so the key's other
+        # grants (vector stores, agents, the MCP field not given) are kept.
+        body["object_permission"] = perm
     if not body and not want_tags:
         raise click.ClickException("nothing to update")
     body["key"] = _call(_resolve_token, c, key_or_alias)
@@ -682,6 +729,9 @@ def keys_rotate(ctx, key_or_alias, duration, yes):
     alias = old.get("key_alias") or key_or_alias
     new_body = {k: old.get(k) for k in ROTATE_FIELDS if old.get(k) not in (None, [], {})}
     new_body["key_alias"] = alias
+    perm = mcp_mod.permission_body(old.get("object_permission"))
+    if perm:  # MCP / vector-store / agent grants live in a separate row: copy them, not the id
+        new_body["object_permission"] = perm
     if duration:
         new_body["duration"] = duration
     steps = [
@@ -1767,6 +1817,469 @@ def usage_report(ctx, group_by, days, start, end, limit):
         _table(d["rows"], _usage_cols(group_by))
 
     _emit(ctx, data, human)
+
+
+# ── mcp (the proxy's MCP gateway) ──────────────────────────────────────────
+
+
+MCP_COLS = [
+    ("name", "SERVER"),
+    ("source", "SRC"),
+    ("transport", "TRANSPORT"),
+    ("auth_type", "AUTH"),
+    ("url", "URL"),
+    ("access_groups", "GROUPS"),
+    ("status", "STATUS"),
+]
+
+
+def all_mcp_servers(conn) -> list[dict]:
+    """The proxy's MCP servers, config- and DB-defined (GET /v1/mcp/server)."""
+    return mcp_mod.as_rows(be.get(conn, "/v1/mcp/server"))
+
+
+def mcp_health(conn, server_ids: list[str] | None = None) -> dict[str, str | None]:
+    """server_id → status from GET /v1/mcp/server/health (connects to each server)."""
+    params = {"server_ids": server_ids} if server_ids else None
+    res = be.get(conn, "/v1/mcp/server/health", params=params)
+    return {r.get("server_id"): r.get("status") for r in mcp_mod.as_rows(res)}
+
+
+def mcp_groups(conn) -> list[str]:
+    return list((be.get(conn, "/v1/mcp/access_groups") or {}).get("access_groups") or [])
+
+
+def _resolve_mcp(conn, ref: str, servers: list[dict] | None = None) -> dict[str, Any]:
+    servers = servers if servers is not None else _call(all_mcp_servers, conn)
+    try:
+        hit = mcp_mod.resolve_server(servers, ref)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if not hit:
+        raise click.ClickException(f"no MCP server matches {ref!r} — run `mcp list`")
+    return hit["server"]
+
+
+def _mcp_db_only(s: dict[str, Any], verb: str) -> None:
+    if s.get("is_config"):
+        raise click.ClickException(
+            f"MCP server {mcp_mod.server_label(s)} is defined in config.yaml (is_config) and is read-only "
+            f"through the API — {verb} it in the config the proxy is deployed from"
+        )
+
+
+def _list_str(row: dict, *fields: str) -> dict:
+    return {**row, **{f: ",".join(row[f]) if isinstance(row.get(f), list) else row.get(f) for f in fields}}
+
+
+@cli.group("mcp")
+def mcp_grp():
+    """MCP servers the proxy fronts: list, health, tools, access, add/update/delete, sessions.
+
+    Servers come from config.yaml (SRC=config, read-only here) or the proxy's
+    database (SRC=db). Keys reach them through `object_permission`
+    (`keys generate|update --mcp-groups/--mcp-servers`).
+    """
+
+
+@mcp_grp.command("list")
+@click.option(
+    "--health", "with_health", is_flag=True, help="Also health-check every server (connects to each)."
+)
+@click.pass_context
+def mcp_list(ctx, with_health):
+    """Every MCP server: name, source, transport, auth, URL origin, access groups.
+
+    The proxy filters this list by the calling key's own MCP access: run it
+    with an admin key for the whole picture (`mcp groups` lists every group
+    even when the key sees none of its servers).
+    """
+    c = _conn(ctx)
+    servers = _call(all_mcp_servers, c)
+    status = _call(mcp_health, c) if with_health else {}
+    rows = [mcp_mod.normalize(s, status.get(s.get("server_id"))) for s in servers]
+    _emit(ctx, rows, lambda r: _table([_list_str(x, "access_groups") for x in r], MCP_COLS))
+
+
+@mcp_grp.command("info")
+@click.argument("server_ref")
+@click.pass_context
+def mcp_info(ctx, server_ref):
+    """One server's full record (live-health-checked by the proxy), secrets redacted.
+
+    SERVER_REF is a server_id, alias or server_name. URLs are cut to their
+    origin, header/env values masked, and credentials listed by field name
+    only: an upstream key can hide in any of them.
+    """
+    c = _conn(ctx)
+    s = _resolve_mcp(c, server_ref)
+    full = _call(be.get, c, mcp_mod.server_path(s["server_id"])) or s
+    _emit(ctx, mcp_mod.redact_server(full))
+
+
+@mcp_grp.command("health")
+@click.argument("server_refs", nargs=-1)
+@click.pass_context
+def mcp_health_cmd(ctx, server_refs):
+    """Health of every server (or the ones named). Exit 2 if any is unhealthy."""
+    c = _conn(ctx)
+    servers = _call(all_mcp_servers, c)
+    picked = [_resolve_mcp(c, r, servers) for r in server_refs]
+    ids = [s["server_id"] for s in picked] or None
+    status = _call(mcp_health, c, ids)
+    names = {s.get("server_id"): mcp_mod.server_label(s) for s in servers}
+    rows = [{"server_id": sid, "name": names.get(sid, sid), "status": st} for sid, st in status.items()]
+    rows.sort(key=lambda r: (r["status"] != "unhealthy", r["name"] or ""))
+    unhealthy = [r["name"] for r in rows if r["status"] == "unhealthy"]
+    data = {"healthy": not unhealthy, "unhealthy": unhealthy, "servers": rows}
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo(f"  {len(d['servers'])} server(s), {len(d['unhealthy'])} unhealthy"),
+            _table(d["servers"], [("name", "SERVER"), ("status", "STATUS"), ("server_id", "ID")]),
+        ),
+    )
+    if unhealthy:
+        ctx.exit(2)
+
+
+@mcp_grp.command("tools")
+@click.option("--server", "server_ref", default=None, help="Only this server's tools (id, alias or name).")
+@click.pass_context
+def mcp_tools(ctx, server_ref):
+    """Tools the CALLING key can see through the gateway, by server.
+
+    Runs as whatever key the CLI authenticates with: to audit what another
+    key reaches, use `mcp access`. read_only/destructive are the server's own
+    annotations (hints, not enforced by the proxy).
+    """
+    c = _conn(ctx)
+    servers = _call(all_mcp_servers, c)
+    labels = [mcp_mod.server_label(s) for s in servers]
+    tools = [
+        mcp_mod.normalize_tool(t, labels) for t in mcp_mod.as_rows(_call(be.get, c, "/v1/mcp/tools"), "tools")
+    ]
+    if server_ref:
+        want = mcp_mod.server_label(_resolve_mcp(c, server_ref, servers))
+        tools = [t for t in tools if t["server"] == want]
+    per: dict[str, int] = {}
+    for t in tools:
+        per[t["server"] or "(unprefixed)"] = per.get(t["server"] or "(unprefixed)", 0) + 1
+    data = {"count": len(tools), "by_server": dict(sorted(per.items())), "tools": tools}
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo(
+                f"  {d['count']} tool(s): " + ", ".join(f"{k} {v}" for k, v in d["by_server"].items())
+            ),
+            _table(
+                d["tools"],
+                [("server", "SERVER"), ("tool", "TOOL"), ("read_only", "RO"), ("description", "DESCRIPTION")],
+            ),
+        ),
+    )
+
+
+@mcp_grp.command("groups")
+@click.pass_context
+def mcp_groups_cmd(ctx):
+    """MCP access groups and the servers in each (what `--mcp-groups` grants)."""
+    c = _conn(ctx)
+    groups = _call(mcp_groups, c)
+    servers = _call(all_mcp_servers, c)
+    rows = [
+        {
+            "group": g,
+            "servers": sorted(
+                mcp_mod.server_label(s) for s in servers if g in (s.get("mcp_access_groups") or [])
+            ),
+        }
+        for g in groups
+    ]
+    open_to_all = sorted(mcp_mod.server_label(s) for s in servers if s.get("allow_all_keys"))
+    data = {"groups": rows, "allow_all_keys": open_to_all}
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            _table(
+                [_list_str(r, "servers") for r in d["groups"]], [("group", "GROUP"), ("servers", "SERVERS")]
+            ),
+            click.echo(f"  every key (allow_all_keys): {', '.join(d['allow_all_keys']) or '(none)'}"),
+        ),
+    )
+
+
+@mcp_grp.command("access")
+@click.option("--server", "server_ref", default=None, help="Only keys whose own grant reaches this server.")
+@click.option("--team", default=None, help="Only keys of this team_id.")
+@click.pass_context
+def mcp_access(ctx, server_ref, team):
+    """Which keys reach which MCP servers, from each key's own object_permission.
+
+    `reaches` is groups ∪ named servers ∪ allow_all_keys servers. A key with
+    no MCP grant of its own shows `reaches: null`: it inherits from its team
+    (or, as an admin key, reaches everything) — not resolved here.
+    """
+    c = _conn(ctx)
+    servers = _call(all_mcp_servers, c)
+    want = mcp_mod.server_label(_resolve_mcp(c, server_ref, servers)) if server_ref else None
+    names = {s.get("server_id"): mcp_mod.server_label(s) for s in servers}
+    rows = []
+    for k in _call(all_keys, c, team):
+        g = mcp_mod.key_mcp(k)
+        reaches = mcp_mod.effective_servers(g, servers)
+        if want and (reaches is None or want not in reaches):
+            continue
+        rows.append(
+            {
+                "key_alias": k.get("key_alias") or k.get("key_name"),
+                "team_id": k.get("team_id"),
+                "access_groups": g["access_groups"],
+                "servers": [names.get(s, s) for s in g["servers"]],
+                "reaches": reaches,
+            }
+        )
+    _emit(
+        ctx,
+        {"server": want, "keys": rows},
+        lambda d: _table(
+            [
+                {
+                    **_list_str(r, "access_groups", "servers"),
+                    "reaches": "(inherited)" if r["reaches"] is None else ",".join(r["reaches"]) or "(none)",
+                }
+                for r in d["keys"]
+            ],
+            [
+                ("key_alias", "KEY"),
+                ("team_id", "TEAM"),
+                ("access_groups", "GROUPS"),
+                ("servers", "SERVERS"),
+                ("reaches", "REACHES"),
+            ],
+        ),
+    )
+
+
+def _mcp_server_options(fn):
+    for opt in reversed(
+        [
+            click.option("--description", default=None),
+            click.option("--url", default=None, help="Server endpoint, e.g. https://mcp.example/mcp."),
+            click.option("--transport", type=click.Choice(mcp_mod.TRANSPORTS), default=None),
+            click.option("--auth-type", type=click.Choice(mcp_mod.AUTH_TYPES), default=None),
+            click.option(
+                "--auth-value-env",
+                default=None,
+                metavar="VAR",
+                help="Env var holding the upstream credential (never passed on the command line).",
+            ),
+            click.option("--access-groups", default=None, help="Comma-separated MCP access groups."),
+            click.option(
+                "--allowed-tools", default=None, help="Comma-separated tool allowlist (unprefixed names)."
+            ),
+        ]
+    ):
+        fn = opt(fn)
+    return fn
+
+
+@mcp_grp.command("add")
+@click.option("--name", required=True, help="server_name; clients see tools as <alias-or-name>-<tool>.")
+@click.option("--alias", default=None, help="Tool prefix, if different from --name.")
+@click.option("--server-id", default=None, help="Pin the id; the proxy generates one if omitted.")
+@_mcp_server_options
+@click.option("--allow-all-keys", is_flag=True, help="Every key may use this server, grant or not.")
+@click.pass_context
+def mcp_add(
+    ctx,
+    name,
+    alias,
+    server_id,
+    description,
+    url,
+    transport,
+    auth_type,
+    auth_value_env,
+    access_groups,
+    allowed_tools,
+    allow_all_keys,
+):
+    """Add an MCP server to the proxy's database (POST /v1/mcp/server).
+
+    A DB-only server: it survives a config redeploy and is not in git.
+    `--transport` defaults to http (the proxy's own default is sse). stdio
+    servers are refused here: they run a process on the proxy host and belong
+    in reviewed config.
+    """
+    try:
+        secret = mcp_mod.secret_from_env(auth_value_env)
+        body = mcp_mod.new_server(
+            name,
+            url=url,
+            transport=transport or "http",
+            server_id=server_id,
+            alias=alias,
+            description=description,
+            auth_type=auth_type,
+            auth_value=secret,
+            access_groups=mcp_mod.split_csv(access_groups),
+            allowed_tools=mcp_mod.split_csv(allowed_tools),
+            allow_all_keys=allow_all_keys,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/v1/mcp/server", mcp_mod.masked_body(body, auth_value_env)):
+        return
+    res = _call(be.post, _conn(ctx), "/v1/mcp/server", body) or {}
+    out = mcp_mod.redact_server(res) if isinstance(res, dict) else res
+    _emit(
+        ctx, out, lambda r: click.echo(f"  added MCP server {mcp_mod.server_label(r)} ({r.get('server_id')})")
+    )
+
+
+@mcp_grp.command("update")
+@click.argument("server_ref")
+@click.option("--alias", default=None)
+@_mcp_server_options
+@click.option(
+    "--allow-all-keys/--no-allow-all-keys", default=None, help="Open to every key, or back to grants only."
+)
+@click.pass_context
+def mcp_update(
+    ctx,
+    server_ref,
+    alias,
+    description,
+    url,
+    transport,
+    auth_type,
+    auth_value_env,
+    access_groups,
+    allowed_tools,
+    allow_all_keys,
+):
+    """Change a DB server (PUT /v1/mcp/server): only the flags given are sent.
+
+    `--access-groups ''` / `--allowed-tools ''` clear the list. Config servers
+    are refused: the API cannot change them.
+    """
+    c = _conn(ctx)
+    s = _resolve_mcp(c, server_ref)
+    _mcp_db_only(s, "change")
+    try:
+        body = mcp_mod.update_server(
+            s["server_id"],
+            alias=alias,
+            description=description,
+            url=url,
+            transport=transport,
+            auth_type=auth_type,
+            auth_value=mcp_mod.secret_from_env(auth_value_env),
+            access_groups=mcp_mod.split_csv(access_groups),
+            allowed_tools=mcp_mod.split_csv(allowed_tools),
+            allow_all_keys=allow_all_keys,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "PUT", "/v1/mcp/server", mcp_mod.masked_body(body, auth_value_env)):
+        return
+    res = _call(be.put, c, "/v1/mcp/server", body) or {}
+    _emit(ctx, mcp_mod.redact_server(res) if isinstance(res, dict) else res)
+
+
+@mcp_grp.command("delete")
+@click.argument("server_ref")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def mcp_delete(ctx, server_ref, yes):
+    """Remove a DB server (DELETE /v1/mcp/server/{id}); its tools vanish from every client.
+
+    The proxy does not clean up grants: keys that name the server keep the
+    stale id (ignored at runtime). The output names them so they can be
+    re-granted with `keys update --mcp-servers`.
+    """
+    c = _conn(ctx)
+    s = _resolve_mcp(c, server_ref)
+    _mcp_db_only(s, "remove")
+    path = mcp_mod.server_path(s["server_id"])
+    if _dry(ctx, "DELETE", path):
+        return
+    stale = [k.get("key_alias") or k.get("token") for k in mcp_mod.keys_granting(_call(all_keys, c), s)]
+    _confirm(ctx, yes, f"delete MCP server {mcp_mod.server_label(s)} (named by {len(stale)} key grant(s))")
+    _call(be.delete, c, path)
+    _emit(
+        ctx,
+        {"deleted": s["server_id"], "name": mcp_mod.server_label(s), "keys_with_stale_grant": stale},
+        lambda d: (
+            click.echo(f"deleted MCP server {d['name']} ({d['deleted']})"),
+            click.echo("keys still naming it: " + (", ".join(d["keys_with_stale_grant"]) or "(none)")),
+        ),
+    )
+
+
+SESSION_COLS = [
+    ("session_id_prefix", "SESSION"),
+    ("client_name", "CLIENT"),
+    ("user_id", "USER"),
+    ("key_alias", "KEY"),
+    ("client_ip", "IP"),
+    ("idle_seconds", "IDLE(s)"),
+    ("in_flight_requests", "IN-FLIGHT"),
+]
+
+
+@mcp_grp.command("sessions")
+@click.pass_context
+def mcp_sessions(ctx):
+    """Live stateful gateway sessions — on the ONE worker that answered.
+
+    The proxy reports per process (`worker_pid`); with several workers or
+    pods, repeat the call or target each node with --url.
+    """
+    res = _call(be.get, _conn(ctx), "/v1/mcp/sessions") or {}
+    _emit(
+        ctx,
+        res,
+        lambda r: (
+            click.echo(f"  worker {r.get('worker_pid')}: {r.get('total_sessions', 0)} session(s)"),
+            _table(r.get("sessions") or [], SESSION_COLS),
+        ),
+    )
+
+
+@mcp_grp.command("sessions-close")
+@click.option(
+    "--prefix", default=None, help=f"Session id prefix (at least {mcp_mod.SESSION_PREFIX_MIN} chars)."
+)
+@click.option("--user", default=None, help="Close every session this LiteLLM user_id opened.")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def mcp_sessions_close(ctx, prefix, user, yes):
+    """Force-close live gateway sessions (DELETE /v1/mcp/sessions), on the worker that answers."""
+    if not prefix and not user:
+        raise click.ClickException("select sessions with --prefix and/or --user")
+    if prefix and len(prefix) < mcp_mod.SESSION_PREFIX_MIN:
+        raise click.ClickException(f"--prefix needs at least {mcp_mod.SESSION_PREFIX_MIN} characters")
+    params = {k: v for k, v in {"session_id_prefix": prefix, "user_id": user}.items() if v}
+    if ctx.obj["dry_run"]:
+        _emit(ctx, {"dry_run": True, "would": "DELETE /v1/mcp/sessions", "params": params})
+        return
+    _confirm(ctx, yes, "close MCP sessions " + ", ".join(f"{k}={v}" for k, v in params.items()))
+    res = _call(be.delete, _conn(ctx), "/v1/mcp/sessions", params=params) or {}
+    _emit(
+        ctx,
+        res,
+        lambda r: (
+            click.echo(
+                f"  worker {r.get('worker_pid')}: closed {r.get('terminated_sessions', 0)} session(s)"
+            ),
+            _table(r.get("sessions") or [], SESSION_COLS),
+        ),
+    )
 
 
 # ── drift / lint / fleet ────────────────────────────────────────────────────

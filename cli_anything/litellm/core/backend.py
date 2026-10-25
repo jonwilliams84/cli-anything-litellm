@@ -115,3 +115,11 @@ def get(conn, path, **kw):
 
 def post(conn, path, body=None, **kw):
     return request(conn, "POST", path, body=body, **kw)
+
+
+def put(conn, path, body=None, **kw):
+    return request(conn, "PUT", path, body=body, **kw)
+
+
+def delete(conn, path, **kw):
+    return request(conn, "DELETE", path, **kw)

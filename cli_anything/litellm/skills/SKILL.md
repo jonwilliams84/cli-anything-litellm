@@ -13,7 +13,10 @@ description: >-
   reports the proxy aggregates in its own
   database (/global/spend/report: per
   day/team/key/model/customer over any window, even one a raw-log download
-  could not carry).
+  could not carry); the MCP gateway — MCP servers the proxy fronts (list,
+  health, tools, access groups, add/update/delete DB servers, live gateway
+  sessions) and which keys reach which servers (keys --mcp-groups/--mcp-servers,
+  mcp access).
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
@@ -75,11 +78,18 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | How much does one feature (or project, or cost centre) cost? | `spend --by tag` — keys tagged with `keys generate|update --tags`; a request riding several tags is counted under each, `(untagged)` for none |
 | Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M|--tag T] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
 | Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M|--tag T] [--days 7]` |
+| MCP: which servers does the gateway front, are they up? | `mcp list [--health]` (`SRC=config` = config.yaml, read-only here; `db` = added via API/UI), `mcp health [SERVER...]` (exit 2 = one is unhealthy), `mcp info <id|alias|name>` (secrets redacted) |
+| MCP: what tools does a client see? | `mcp tools [--server S]` — for the key the CLI runs as; `mcp groups` — each access group and its servers |
+| MCP: which keys reach which servers? | `mcp access [--server S] [--team T]` — from each key's own `object_permission`; `reaches: null` = inherited from team/role |
+| MCP: grant / revoke a key's servers | `keys generate|update K --mcp-groups devtools,home` / `--mcp-servers ha,grafana` (`none` = no MCP at all; `''` clears groups) |
+| MCP: add / change / remove a DB server | `mcp add --name N --url U [--alias A] [--access-groups g] [--auth-type bearer_token --auth-value-env VAR]`, `mcp update S --access-groups g`, `mcp delete S --yes` |
+| MCP: who is connected right now? kick a session | `mcp sessions` (per worker process), `mcp sessions-close --user U|--prefix P --yes` |
 | What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
-`users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete` need `--yes`
+`users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
+`mcp delete`, `mcp sessions-close` need `--yes`
 when there is no TTY.
 
 ## Workflow for any change
@@ -166,6 +176,37 @@ when there is no TTY.
   `keys update --tags` replaces the tag set and keeps the rest of the key's
   metadata (`/key/update` otherwise replaces the whole object), and `keys
   rotate` carries the tags over to the replacement key.
+
+- **MCP servers have two sources, like models.** `mcp_servers:` in config.yaml
+  shows as `SRC=config` (`is_config: true`): the API cannot change or delete it,
+  so `mcp update` / `mcp delete` refuse and point at the config. `mcp add`
+  writes a DB row that survives redeploys and is not in git. Tool names are
+  `<alias-or-server_name>-<tool>`, which is why the proxy (and `mcp add`)
+  refuses a `-` in a server name or alias — use `_`.
+- **`mcp list` is filtered by the calling key.** The proxy returns only the
+  servers the key may reach (a key with no MCP grant sees none);
+  `mcp groups` lists every group. Run audits with an admin key. `mcp tools`
+  is always "what THIS key sees" — use `mcp access` for other keys.
+- **MCP secrets hide outside `credentials`.** An admin read still returns the
+  server URL (integrations often embed the API key in the path or query),
+  `static_headers`, `env`/`env_vars` and stdio `args`. Everything this CLI
+  prints cuts URLs to their origin, masks header/env values and lists
+  credential fields by name only. MCP credentials have no `os.environ/`
+  indirection on the proxy, so `mcp add|update --auth-value-env VAR` reads the
+  secret from the CLI's environment (never argv) and `--dry-run` masks it.
+- **Key MCP grants merge per field.** `/key/update` merges `object_permission`
+  field by field, so `keys update K --mcp-groups g` leaves the key's
+  `mcp_servers`, vector stores and agents alone. Group names are checked
+  against `/v1/mcp/access_groups` first (a typo would grant nothing,
+  silently); server refs are resolved to ids. `keys rotate` copies the grant
+  to the new key (not the old key's permission row id).
+- **`mcp delete` leaves stale grants.** The proxy does not remove the server
+  id from keys that named it; the output lists them (`keys_with_stale_grant`).
+- **Sessions are per worker process.** `mcp sessions` / `sessions-close` act
+  on whichever worker answered (`worker_pid`); with several workers or pods,
+  repeat or target each node with `--url`. Both need an admin key (403
+  otherwise). `mcp health` connects to every server; `mcp list` does not
+  unless `--health`.
 
 ## Site policy files
 

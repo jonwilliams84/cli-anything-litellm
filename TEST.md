@@ -2,7 +2,8 @@
 
 All tests are offline: `pip install -e '.[dev]' && pytest`. No proxy is needed —
 `be.get` / `be.post` are mocked, and the fixtures reproduce the response shapes
-of a real LiteLLM v1.100.1 proxy.
+of a real LiteLLM v1.100.1 proxy (the MCP fixtures, `tests/mcp_fixtures.py`:
+v1.106.3, each factory citing the source function it reproduces).
 
 ## Layout
 
@@ -11,6 +12,7 @@ of a real LiteLLM v1.100.1 proxy.
 | `tests/test_harness.py` | Original build: core (`models`, `drift`, `lint`, `backend`) and CLI behaviours (dry-run, confirm, rotation, spend grouping, 401 hint). |
 | `tests/test_core.py` | Unit tests for the newer cores: `models.new_deployment` / `models.resolve_model_target` (body construction, required args, id vs model-name match), `users.new_user` / `users.update_user` / `users.resolve_user_target` / `users.normalize` (body + role validation, id vs unique-email resolution, ambiguous email refused), `teams.new_team` / `teams.update_team` / `teams.resolve_team_target` / `teams.normalize` / `teams.member_entry` (body + member-role validation, id vs unique-alias resolution, ambiguous alias refused), `budgets.as_rows` / `budgets.new_budget` / `budgets.update_budget` / `budgets.normalize` / `budgets.resolve_budget_target` (envelope tolerance, nothing-to-cap refusal, per-model caps via dict or JSON string, exact-id match) and `customers.as_rows` / `customers.new_customer` / `customers.update_customer` / `customers.normalize` / `customers.ids_body` / `customers.resolve_customer_target` (envelope tolerance, user_id-or-alias requirement, plural delete body, id vs unique-alias resolution, ambiguous alias refused), and `logs.latency_ms` / `logs.filter_logs` / `logs.normalize` / `logs.token_of` / `logs.key_alias_map` / `logs.summary` (shape tolerance, sha256 vs alias vs ambiguous-alias key references, per-field filters, percentiles, per-model breakdown), and `tags.parse_tags` / `tags.as_metadata` / `tags.key_tags` / `tags.log_row_tags` / `tags.filter_by_tags` / `tags.spend_by_tag` (tag parsing and emptiness refusal, metadata merge, `metadata.tags` vs flat `tags` vs the JSON-text `request_tags` column, per-row tag filters, the several-tags-per-request aggregation with `(untagged)`), and `usage.window` / `usage.params` / `usage.as_rows` / `usage.normalize` / `usage.totals` (window construction and validation, dimension→`group_by` mapping, envelope tolerance, sha256-named key rows with the recorded alias winning, the `day` client-side summation, roll-ups). |
 | `tests/test_full_e2e.py` | End-to-end and workflow tests: `models add` / `models delete` over the mocked API (`--dry-run` body == exact request body, `--yes` gating, replica counting, unknown-ref error), a `drift`-gap → `models add` → `models list --deployments` workflow, the delete-what-`drift`-found workflow, the user-management set (`users list/info/create/update/delete` + the onboard→key→delete workflow), the team-management set (`teams create/update/delete/member-add/member-delete/block/unblock` + the team→key→delete workflow), the budget-management set (`budgets list/info/create/update/delete` + the create→attach→reprice→delete workflow) and the customer-management set (`customers list/info/create/update/block/unblock/delete` + the onboard→budget→block→unblock→delete workflow), and the request-log set (`logs list` / `logs summary`: caller naming, key/user/team/model filters, `--limit`, ambiguous-alias error, latency percentiles) plus the `spend --by key` → `logs list --key` drill-down workflow, and the tag set (`keys generate --tags` / `keys update --tags` with metadata merge and empty-refusal, `keys list` tags column, `spend --by tag`, `logs list --tag` / `logs summary --tag`, and the tag-chargeback workflow: generate→spend→logs→retag), and the usage-report set (`usage report`: `--days` and explicit `--start/--end` query construction, range validation before the proxy, `--json` shape, `--by api_key` naming through the live key list with no hash in the output, `--limit`, the junk-row tolerance) plus the money-view workflow (`spend --by key` and `usage report --by api_key` name the same caller the same way and agree on the total; `logs list --key` is the drill-down). |
+| `tests/test_mcp.py` | MCP gateway (v0.10.0): `core/mcp.py` units (envelope tolerance, labels, URL-origin redaction, server redaction never carrying a secret, row normalisation, id/alias/name resolution with ambiguity refused, POST/PUT body construction and every client-side refusal, env-sourced secrets, dry-run masking, tool→server attribution, key grants, effective reach, grant validation, stale grants, path escaping), `backend.put/delete`, the `mcp` command set over the mocked proxy, `keys generate|update --mcp-*`, `keys list` `mcp` field, `keys rotate` carrying the grant, two workflows, and subprocess tests of the installed command (`_resolve_cli`: help, a dry-run that never leaks the env secret, a loud failure on an unreachable proxy). |
 
 ## DB-model management coverage (`models add` / `models delete`, v0.2.0)
 
@@ -217,6 +219,59 @@ of a real LiteLLM v1.100.1 proxy.
   same way and agree on the total; `logs list --key <alias>` names the
   requests behind it.
 
+## MCP gateway coverage (`mcp ...`, `keys --mcp-*`, v0.10.0: `core/mcp.py`)
+
+Fixtures reproduce LiteLLM v1.106.3 (`tests/mcp_fixtures.py`):
+
+| Fixture | Source (litellm/ in v1.106.3) |
+|---|---|
+| `mcp_server()` / `SERVERS` | `LiteLLM_MCPServerTable` (`models/mcp_server.py`) as `fetch_all_mcp_servers` returns it after `_redact_mcp_credentials` (`proxy/management_endpoints/mcp_management_endpoints.py`); config rows per `build_mcp_server_table` (`proxy/_experimental/mcp_server/mcp_server_manager.py`). Checked field-for-field against a live v1.106.3 `GET /v1/mcp/server`. |
+| `health()` | `health_check_servers` — a bare `[{server_id, status}]` list. |
+| `tool()` / `TOOLS` | `get_mcp_tools` — `{"tools": [Tool.model_dump(by_alias=True)]}`, names from `add_server_prefix_to_name` (`proxy/_experimental/mcp_server/utils.py`). |
+| `GROUPS` | `get_mcp_access_groups` — `{"access_groups": sorted(...)}`. |
+| `SESSIONS` / `session()` / `terminated()` | `MCPGatewaySessionsResponse`, `MCPGatewaySession`, `MCPGatewaySessionsTerminateResponse` (`types/mcp.py`), from `get_mcp_gateway_sessions_report` (`proxy/_experimental/mcp_server/server.py`). |
+| `permission()` | `LiteLLM_ObjectPermissionTable` (`proxy/schema.prisma`) as `attach_object_permission_to_dict` (`proxy/management_helpers/object_permission_utils.py`) attaches it; matches a live v1.106.3 `/key/info`. |
+| `key()` | `/key/list?return_full_object=true` rows from `_list_key_helper` (`proxy/management_endpoints/key_management_endpoints.py`), which attaches `object_permission`. |
+
+- `mcp list` reads `/v1/mcp/server` and makes no server connection unless
+  `--health` (then `/v1/mcp/server/health`); rows are `normalize` (name =
+  alias or server_name, `source` config|db, URL origin only). No fixture
+  secret (URL query, header, env var) reaches the output.
+- `mcp info` resolves an alias/name to the id first and fetches
+  `/v1/mcp/server/{id}`; output is `redact_server` (credential field names
+  only). Unknown refs point at `mcp list`.
+- `mcp health` exits 2 when any server is unhealthy and lists those first;
+  named servers are sent as `server_ids`.
+- `mcp tools` counts tools per server (longest label wins, so `ha_admin-x` is
+  not filed under `ha`) and `--server` filters by id, alias or name.
+- `mcp groups` lists group members and `allow_all_keys` servers; `mcp access`
+  computes groups ∪ named servers ∪ open servers per key, shows keys with
+  no grant as inherited, honours the `no-mcp-servers` sentinel, filters by
+  `--server`.
+- `mcp add`: `--dry-run` prints the body with the credential masked (`**** (from
+  $VAR)`) and sends nothing; the real POST carries the secret and the printed
+  row does not. Refused before the proxy: `-` in name/alias, missing URL,
+  stdio, reserved ids, unknown auth types, a credential without
+  `--auth-type`, an unset `--auth-value-env`.
+- `mcp update` PUTs only the flags given (`''` clears a list,
+  `--no-allow-all-keys` sends `false`); nothing to change is an error. Config
+  servers are refused by `update` and `delete`.
+- `mcp delete` is dry-runnable, refuses without `--yes` off a TTY, and names
+  the keys whose own grant still names the deleted server.
+- `mcp sessions` / `sessions-close`: the selector is required and the prefix
+  length checked client-side; dry-run, `--yes` gating, query params, and a
+  clean error on the proxy's 403 for non-admin keys.
+- `keys generate|update --mcp-groups/--mcp-servers` build `object_permission`
+  (unknown group or server refused before the proxy; `none` → the opt-out
+  sentinel; an MCP-only update is enough). `keys rotate` carries the grant
+  without the old row id.
+- Workflows: add a server → health → grant a key by server (the proxy's
+  per-field merge simulated, devtools grant kept) → `mcp access` → delete
+  names the stale grant; and incident triage: `mcp health` exit 2 →
+  `mcp access --server <unhealthy>` names the affected keys.
+
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 190 passed, 87.9% coverage (v0.9.0); `ruff check` and `ruff format --check` clean.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q` — 262 passed, 90.3% coverage (v0.10.0; `core/mcp.py` 97%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, as are the new `tests/test_mcp.py` and `tests/mcp_fixtures.py`; a repo-wide `ruff check .` still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
+
+(v0.9.0: 190 passed, 87.9% coverage.)
