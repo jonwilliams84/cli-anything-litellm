@@ -78,7 +78,10 @@ def request(
     params: dict | None = None,
     body: Any = None,
     auth: bool = True,
+    response_headers: dict[str, str] | None = None,
 ) -> Any:
+    """One call. ``response_headers``, when given, is filled with the reply's
+    headers (lower-cased names), on errors too — ``x-litellm-*`` live there."""
     if not conn.get("url"):
         raise ApiError(None, "no proxy URL: pass --url, set LITELLM_URL, or `config set`", path)
     url = f"{conn['url']}{path}"
@@ -99,6 +102,8 @@ def request(
         )
     except requests.RequestException as exc:
         raise ApiError(None, f"{type(exc).__name__}: {exc}", url) from exc
+    if response_headers is not None:
+        response_headers.update({k.lower(): v for k, v in resp.headers.items()})
     if resp.status_code >= 400:
         raise ApiError(resp.status_code, _error_text(resp), url)
     if not resp.content:

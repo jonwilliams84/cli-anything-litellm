@@ -22,7 +22,9 @@ from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import budgets as budgets_mod
 from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
+from cli_anything.litellm.core import fallbacks as fb_mod
 from cli_anything.litellm.core import guardrails as guard_mod
+from cli_anything.litellm.core import health as health_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import logs as logs_mod
 from cli_anything.litellm.core import mcp as mcp_mod
@@ -50,17 +52,21 @@ def _emit(ctx: click.Context, data: Any, human=None) -> None:
         click.echo(human)
 
 
+def _api_error(e: be.ApiError) -> click.ClickException:
+    hint = ""
+    if e.status == 401:
+        hint = (
+            "  (wrong key — behind a VIP, a 401 on SOME requests usually means the "
+            "gateways' master keys differ)"
+        )
+    return click.ClickException(f"{e}{hint}")
+
+
 def _call(fn, *a, **kw):
     try:
         return fn(*a, **kw)
     except be.ApiError as e:
-        hint = ""
-        if e.status == 401:
-            hint = (
-                "  (wrong key — behind a VIP, a 401 on SOME requests usually means the "
-                "gateways' master keys differ)"
-            )
-        raise click.ClickException(f"{e}{hint}") from e
+        raise _api_error(e) from e
 
 
 def _dry(ctx: click.Context, method: str, path: str, body: Any = None) -> bool:
@@ -228,11 +234,19 @@ def status(ctx):
     _emit(ctx, out, None)
 
 
-@cli.command("health")
+@cli.group("health", invoke_without_command=True)
 @click.option("--model", default=None, help="Only this model group.")
 @click.pass_context
 def health(ctx, model):
-    """Per-deployment health (GET /health). Sends a real request to every backend."""
+    """Per-deployment health (GET /health). Sends a real request to every backend.
+
+    `health latest` and `health history` read what the proxy's own health
+    checks recorded instead, and call no backend.
+    """
+    if ctx.invoked_subcommand is not None:
+        if model:
+            raise click.UsageError("--model belongs to `health` alone or to `health history --model`")
+        return
     c = _conn(ctx)
     res = _call(be.get, c, "/health", params={"model": model} if model else None) or {}
 
@@ -258,6 +272,92 @@ def health(ctx, model):
     _emit(ctx, data, human)
 
 
+def _short(text: str | None, width: int = 100) -> str | None:
+    """One table line: whitespace (newlines from upstream JSON bodies) collapsed, then cut."""
+    if not text:
+        return text
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _health_note(r: dict) -> str:
+    return "gone" if r.get("live") is False else ("blocked" if r.get("blocked") else "")
+
+
+@health.command("latest")
+@click.option("--unhealthy", "only_unhealthy", is_flag=True, help="Only rows that are not healthy.")
+@click.pass_context
+def health_latest(ctx, only_unhealthy):
+    """Last recorded status of every deployment (GET /health/latest). Calls no backend.
+
+    Joined to the live deployments: SINCE is when that status was recorded
+    (background checks record only status changes), `gone` marks a row whose
+    deployment no longer exists, `blocked` one an admin paused, and a live
+    deployment never checked shows as `unknown`. Exit 2 when a live, unpaused
+    deployment is unhealthy.
+    """
+    c = _conn(ctx)
+    res = _call(be.get, c, "/health/latest")
+    rows = health_mod.latest_rows(res, _call(live_deployments, c))
+    if only_unhealthy:
+        rows = [r for r in rows if r["status"] != "healthy"]
+    _emit(
+        ctx,
+        rows,
+        lambda r: _table(
+            [dict(x, note=_health_note(x), error=_short(x["error"])) for x in r],
+            [
+                ("status", "STATUS"),
+                ("model_name", "MODEL"),
+                ("model_id", "ID"),
+                ("checked_at", "SINCE"),
+                ("response_time_ms", "MS"),
+                ("note", "NOTE"),
+                ("error", "ERROR"),
+            ],
+        ),
+    )
+    if any(r["status"] == "unhealthy" and r["live"] and not r["blocked"] for r in rows):
+        ctx.exit(2)
+
+
+@health.command("history")
+@click.option("--model", default=None, help="Only this model group (model_name).")
+@click.option("--status", type=click.Choice(health_mod.STATUSES), default=None)
+@click.option("--limit", type=int, default=50, show_default=True, help=f"1..{health_mod.HISTORY_MAX}.")
+@click.option("--offset", type=int, default=0, show_default=True, help="Skip this many newer records.")
+@click.pass_context
+def health_history(ctx, model, status, limit, offset):
+    """Recorded health checks, newest first (GET /health/history). Calls no backend.
+
+    Background checks record a row only when a deployment's status changes, so
+    this reads as "when did it go down, when did it come back".
+    """
+    try:
+        params = health_mod.history_params(model, status, limit, offset)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    res = _call(be.get, _conn(ctx), "/health/history", params=params)
+    rows = [health_mod.normalize(r) for r in health_mod.as_rows(res, "health_checks")]
+
+    def human(r):
+        _table(
+            [dict(x, error=_short(x["error"])) for x in r],
+            [
+                ("checked_at", "WHEN"),
+                ("status", "STATUS"),
+                ("model_name", "MODEL"),
+                ("model_id", "ID"),
+                ("checked_by", "BY"),
+                ("error", "ERROR"),
+            ],
+        )
+        if len(r) == limit:
+            click.echo(f"  (more: --offset {offset + limit})")
+
+    _emit(ctx, rows, human)
+
+
 # ── models / router / guardrails ────────────────────────────────────────────
 
 
@@ -279,6 +379,7 @@ def models_list(ctx, deployments):
                 "api_base": (d.get("litellm_params") or {}).get("api_base"),
                 "max_input_tokens": (d.get("model_info") or {}).get("max_input_tokens"),
                 "source": "db" if models_mod.is_db_model(d) else "config",
+                "blocked": models_mod.is_blocked(d),
             }
             for d in deps
         ]
@@ -286,13 +387,14 @@ def models_list(ctx, deployments):
             ctx,
             rows,
             lambda r: _table(
-                r,
+                [dict(x, paused="yes" if x["blocked"] else "") for x in r],
                 [
                     ("model_name", "MODEL"),
                     ("id", "ID"),
                     ("api_base", "BACKEND"),
                     ("max_input_tokens", "CTX"),
                     ("source", "SRC"),
+                    ("paused", "PAUSED"),
                 ],
             ),
         )
@@ -315,6 +417,7 @@ def models_list(ctx, deployments):
                 ("model_name", "MODEL"),
                 ("replicas", "REPLICAS"),
                 ("db_replicas", "FROM-DB"),
+                ("blocked_replicas", "PAUSED"),
                 ("backends", "BACKENDS"),
                 ("mode", "MODE"),
                 ("max_input_tokens", "CTX"),
@@ -402,6 +505,65 @@ def models_delete(ctx, model_or_id, yes):
     _emit(ctx, res, lambda r: click.echo(f"  deleted {kind}: {r.get('message') or 'ok'}"))
 
 
+def _set_blocked(ctx, model_id: str, blocked: bool, yes: bool = False) -> None:
+    verb = "block" if blocked else "unblock"
+    c = _conn(ctx)
+    deps = _call(live_deployments, c)
+    try:
+        d = models_mod.resolve_deployment(deps, model_id, verb)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    group = d.get("model_name")
+    serving = models_mod.serving_replicas(deps, group, excluding=model_id)
+    out = {"model_id": model_id, "model_name": group, "blocked": blocked, "serving_replicas": serving}
+    if models_mod.is_blocked(d) == blocked:
+        _emit(ctx, {**out, "changed": False}, f"  {model_id} is already {verb}ed")
+        return
+    body = {"model_id": model_id}
+    if _dry(ctx, "POST", f"/model/{verb}", body):
+        return
+    if blocked:
+        impact = (
+            f"{serving} other replica(s) of {group} keep serving"
+            if serving
+            else f"the LAST serving replica: {group} stops serving unless a fallback catches it"
+        )
+        _confirm(ctx, yes, f"block deployment {model_id} ({impact})")
+    res = _call(be.post, c, f"/model/{verb}", body)
+    # The reply is the DB row, litellm_params included: never echo it.
+    got = res.get("blocked") if isinstance(res, dict) else None
+    out = {**out, "blocked": blocked if got is None else bool(got), "changed": True}
+    if not blocked:
+        out["serving_replicas"] = serving + 1
+    _emit(
+        ctx,
+        out,
+        lambda r: click.echo(f"  {verb}ed {model_id} ({group}: {r['serving_replicas']} replica(s) serving)"),
+    )
+
+
+@models_grp.command("block")
+@click.argument("model_id")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def models_block(ctx, model_id, yes):
+    """Pause one DB deployment: the router stops sending it traffic (POST /model/block).
+
+    Reversible with `models unblock`; the deployment and its settings stay. The
+    proxy pauses DB deployments only (config ones: change the config). Takes a
+    deployment id, never a group name — blocking every replica is an outage.
+    """
+    _set_blocked(ctx, model_id, True, yes)
+
+
+@models_grp.command("unblock")
+@click.argument("model_id")
+@click.pass_context
+def models_unblock(ctx, model_id):
+    """Put a paused DB deployment back into rotation (POST /model/unblock)."""
+    _set_blocked(ctx, model_id, False)
+
+
 @cli.group("router")
 def router_grp():
     """Live router settings."""
@@ -413,8 +575,278 @@ def router_grp():
 def router_show(ctx, show_all):
     v = _call(live_router, _conn(ctx))
     if not show_all:
-        v = {k: v.get(k) for k in drift_mod.ROUTER_KEYS if k in v}
+        keep = (*drift_mod.ROUTER_KEYS, *fb_mod.FIELDS.values())
+        v = {k: v.get(k) for k in keep if k in v}
     _emit(ctx, v)
+
+
+@cli.group("fallbacks")
+def fallbacks_grp():
+    """Router fallbacks: which model group takes over when another fails.
+
+    Three lists, one per failure class (--type): general (any error),
+    context_window, content_policy. A list config.yaml sets is owned by the
+    config: `set` and `delete` refuse it (the proxy would change one worker
+    until its next restart).
+    """
+
+
+def _router_settings(conn) -> dict[str, Any]:
+    return be.get(conn, "/router/settings") or {}
+
+
+def _fallback_type_option(fn):
+    return click.option(
+        "--type",
+        "fallback_type",
+        type=click.Choice(fb_mod.TYPES),
+        default="general",
+        show_default=True,
+        help="Failure class the rule covers.",
+    )(fn)
+
+
+def _chain_text(chain) -> str:
+    return " → ".join(chain or []) or "(none)"
+
+
+def _refuse_config_owned(settings: dict[str, Any], fallback_type: str) -> None:
+    if fb_mod.config_owned(settings.get("source"), fallback_type):
+        field = fb_mod.FIELDS[fallback_type]
+        raise click.ClickException(
+            f"router_settings.{field} is set in config.yaml, which owns it: the proxy would change "
+            "only the worker that answered, keep showing the config value, and drop the change on "
+            "restart. Edit the config and redeploy (then `drift`)."
+        )
+
+
+@fallbacks_grp.command("list")
+@click.option(
+    "--model", default=None, help="Only rules that apply to this group (its own, plus * catch-alls)."
+)
+@click.option("--type", "fallback_type", type=click.Choice(fb_mod.TYPES), default=None)
+@click.pass_context
+def fallbacks_list(ctx, model, fallback_type):
+    """Every fallback rule the live router holds (GET /router/settings), with its owner.
+
+    SRC is config (config.yaml) or db (set through the API or the Admin UI —
+    not in git; `drift` reports it).
+    """
+    res = _call(_router_settings, _conn(ctx))
+    rows = fb_mod.list_rows(
+        res.get("current_values"), res.get("source"), model=model, fallback_type=fallback_type
+    )
+    _emit(
+        ctx,
+        rows,
+        lambda r: _table(
+            [dict(x, chain=_chain_text(x["fallbacks"])) for x in r],
+            [("model", "MODEL"), ("type", "TYPE"), ("chain", "FALLBACKS"), ("source", "SRC")],
+        ),
+    )
+
+
+def _resolve_chain(conn, model: str, fallback_type: str) -> dict[str, Any]:
+    """The effective chain for MODEL: from the proxy when it can answer, else from /router/settings.
+
+    ``GET /fallback/{model}`` 404s for every name holding ``/`` (the path
+    parameter does not match a slash) and for a model with no chain; either
+    way the chain is resolved locally, never reported as "none" off a 404.
+    """
+    if fb_mod.path_reachable(model):
+        try:
+            res = be.get(conn, fb_mod.fallback_path(model), params={"fallback_type": fallback_type}) or {}
+        except be.ApiError as e:
+            if e.status != 404:
+                raise _api_error(e) from e
+            reason = f"GET /fallback/{{model}} answered 404 ({e.message})"
+        else:
+            return {
+                "fallback_models": res.get("fallback_models") or [],
+                "resolved_by": "proxy",
+                "match": None,
+                "note": None,
+            }
+    else:
+        reason = "the name contains '/', which GET /fallback/{model} cannot match"
+    current = _call(_router_settings, conn).get("current_values") or {}
+    local = fb_mod.effective_chain(current.get(fb_mod.FIELDS[fallback_type]), model)
+    return {**local, "resolved_by": "router_settings", "reason": reason}
+
+
+@fallbacks_grp.command("show")
+@click.argument("model")
+@_fallback_type_option
+@click.pass_context
+def fallbacks_show(ctx, model, fallback_type):
+    """The chain the router would use for MODEL.
+
+    Resolved the router's way: MODEL's own rule, else a provider-prefixed or
+    stripped match, else the * catch-all. Asks GET /fallback/{model} when it
+    can; for a name containing '/' (which that route cannot match) or a 404,
+    the chain is resolved locally from GET /router/settings (resolved_by).
+    """
+    out = {"model": model, "fallback_type": fallback_type, **_resolve_chain(_conn(ctx), model, fallback_type)}
+
+    def human(r):
+        if r["fallback_models"] or r["resolved_by"] == "proxy":
+            click.echo(f"  {model} ({fallback_type}): {_chain_text(r['fallback_models'])}")
+        else:
+            click.echo(f"  {model} ({fallback_type}): no rule in /router/settings applies")
+        if r["resolved_by"] != "proxy":
+            click.echo(
+                f"  resolved from /router/settings ({r['reason']}); match: {r['match'] or 'no rule applies'}"
+            )
+        if r.get("note"):
+            click.echo(f"  note: {r['note']}")
+
+    _emit(ctx, out, human)
+
+
+@fallbacks_grp.command("set")
+@click.argument("model")
+@click.option("--to", "to", required=True, help="Fallback model groups in order, comma-separated.")
+@_fallback_type_option
+@click.pass_context
+def fallbacks_set(ctx, model, to, fallback_type):
+    """Create or replace MODEL's fallback rule (POST /fallback).
+
+    Every name is checked against the live model groups first. Written to the
+    proxy's DB (needs STORE_MODEL_IN_DB) and applied to the worker that
+    answered; other workers pick it up from the DB. Not in git: `drift` will
+    report it until the config says the same.
+    """
+    c = _conn(ctx)
+    settings = _call(_router_settings, c)
+    _refuse_config_owned(settings, fallback_type)
+    known = {d.get("model_name") for d in _call(live_deployments, c)}
+    try:
+        body = fb_mod.new_body(model, to.split(","), fallback_type, known)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    current = settings.get("current_values") or {}
+    previous = fb_mod.rules(current.get(fb_mod.FIELDS[fallback_type])).get(body["model"])
+    if _dry(ctx, "POST", "/fallback", body):
+        return
+    res = _call(be.post, c, "/fallback", body) or {}
+    out = {**body, "replaced": previous, "message": res.get("message")}
+    _emit(
+        ctx,
+        out,
+        lambda r: click.echo(
+            f"  {r['model']} ({fallback_type}) → {_chain_text(r['fallback_models'])}"
+            + (f"  (was {_chain_text(previous)})" if previous else "")
+        ),
+    )
+
+
+@fallbacks_grp.command("delete")
+@click.argument("model")
+@_fallback_type_option
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def fallbacks_delete(ctx, model, fallback_type, yes):
+    """Remove MODEL's fallback rule (DELETE /fallback/{model}).
+
+    Its failures stop failing over (unless a * catch-all rule still covers it,
+    which the output names).
+    """
+    c = _conn(ctx)
+    settings = _call(_router_settings, c)
+    _refuse_config_owned(settings, fallback_type)
+    held = fb_mod.rules((settings.get("current_values") or {}).get(fb_mod.FIELDS[fallback_type]))
+    chain = held.get(model)
+    if chain is None:
+        raise click.ClickException(f"no {fallback_type} fallback rule for {model!r} (see `fallbacks list`)")
+    if not fb_mod.path_reachable(model):
+        raise click.ClickException(
+            f"cannot delete the {fallback_type} rule for {model!r}: DELETE /fallback/{{model}} does not match "
+            "a name containing '/' (the proxy answers 404 Not Found, escaped or not), so nothing was deleted. "
+            f"Remove it by rewriting router_settings.{fb_mod.FIELDS[fallback_type]} without this rule "
+            "(the DB copy: Admin UI router settings or POST /config/update), or, if config.yaml sets that "
+            "list, edit the config. `fallbacks set` can only replace the chain, not remove it."
+        )
+    path = fb_mod.fallback_path(model)
+    if _dry(ctx, "DELETE", f"{path}?fallback_type={fallback_type}"):
+        return
+    _confirm(ctx, yes, f"delete the {fallback_type} fallback rule {model} → {_chain_text(chain)}")
+    try:
+        be.delete(c, path, params={"fallback_type": fallback_type})
+    except be.ApiError as e:
+        if e.status == 404 and e.message == fb_mod.ROUTE_NOT_FOUND:
+            raise click.ClickException(
+                f"DELETE {path} reached no route (404 Not Found): nothing was deleted"
+            ) from e
+        raise _api_error(e) from e
+    out = {
+        "deleted": model,
+        "fallback_type": fallback_type,
+        "fallbacks": chain,
+        "still_covered_by": held.get(fb_mod.CATCH_ALL) if model != fb_mod.CATCH_ALL else None,
+    }
+    _emit(
+        ctx,
+        out,
+        lambda r: click.echo(
+            f"  deleted {model} ({fallback_type}) → {_chain_text(chain)}"
+            + (
+                f"; the * rule still applies: {_chain_text(r['still_covered_by'])}"
+                if r["still_covered_by"]
+                else ""
+            )
+        ),
+    )
+
+
+@fallbacks_grp.command("test")
+@click.argument("model")
+@_fallback_type_option
+@click.option("--text", default="Reply with the word ok.", show_default=True, help="The prompt sent.")
+@click.pass_context
+def fallbacks_test(ctx, model, fallback_type, text):
+    """Fail MODEL on purpose and check that its fallback chain serves.
+
+    Sends one REAL chat completion with the router's mock-failure flag: the
+    primary is skipped and a fallback answers (logged and billed like any
+    request). Verdict failed_over (exit 0), or chain_failed / not_triggered /
+    unknown (exit 2). Chat model groups only.
+    """
+    c = _conn(ctx)
+    chain = _resolve_chain(c, model, fallback_type)["fallback_models"]
+    if not chain:
+        raise click.ClickException(
+            f"no {fallback_type} fallbacks apply to {model!r}: nothing to test (see `fallbacks show`)"
+        )
+    body = fb_mod.probe_body(model, fallback_type, text)
+    if _dry(ctx, "POST", "/v1/chat/completions", body):
+        return
+    deps = _call(live_deployments, c)
+    headers: dict[str, str] = {}
+    try:
+        be.post(c, "/v1/chat/completions", body, response_headers=headers)
+    except be.ApiError as e:
+        if e.status in (401, 403) or e.status is None:
+            raise _api_error(e) from e
+        out = {
+            "model": model,
+            "chain": chain,
+            "verdict": "chain_failed",
+            "status": e.status,
+            "error": health_mod.redact_error(e.message),
+        }
+    else:
+        out = fb_mod.probe_verdict(model, chain, headers, deps)
+
+    def human(r):
+        click.echo(f"  {r['verdict']}: {model} ({fallback_type}) → {_chain_text(chain)}")
+        if r.get("served_by"):
+            click.echo(f"  served by {r['served_by']} ({r['deployment_id']})")
+        if r.get("error"):
+            click.echo(f"  error {r['status']}: {r['error']}")
+
+    _emit(ctx, out, human)
+    if out["verdict"] != "failed_over":
+        ctx.exit(2)
 
 
 @cli.group("guardrails")
@@ -2749,7 +3181,7 @@ def mcp_sessions_close(ctx, prefix, user, yes):
 )
 @click.pass_context
 def drift(ctx, config_path):
-    """Git config vs the live proxy: deployments, DB-only models, router, guardrails."""
+    """Git config vs the live proxy: deployments, DB-only models, router (fallback chains too), guardrails."""
     c = _conn(ctx)
     res = drift_mod.config_vs_live(
         _load_yaml(config_path), _call(live_deployments, c), _call(live_router, c), _call(live_guardrails, c)

@@ -2,13 +2,14 @@
 
 Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy from the shell.
 
-- **Inspect:** status, per-deployment health, model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag).
+- **Inspect:** status, per-deployment health (live, or the proxy's own recorded checks — `health latest` / `health history`, no backend called), model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag).
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete — tagged for chargeback), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend, spend-by-tag.
+- **Routing resilience:** fallback chains (list, show the effective chain — resolved from router settings for group names with `/`, which the proxy's `/fallback/{model}` route cannot match — set, delete, and `fallbacks test` — fail a group on purpose and see which fallback served), and pausing one DB deployment without deleting it (`models block` / `models unblock`). Fallback lists config.yaml owns are refused (the proxy would drop the change on restart).
 - **MCP gateway:** the MCP servers the proxy fronts — list, health, tools, access groups, add/update/delete DB servers, live gateway sessions — and which keys reach which servers (`mcp access`, `keys generate|update --mcp-groups/--mcp-servers`). Secrets embedded in server URLs, headers and env are never printed.
 - **Guardrails:** config and DB guardrails side by side, add/update/delete DB guardrails (PATCH only, secrets as `os.environ/` refs), `guardrails test` a text against one, usage and fail rates per guardrail, the requests a guardrail judged, and the team submission queue.
 - **Report (server-side):** `usage report` reads `/global/spend/report`, the proxy's own DB aggregation behind the Admin UI's charts — spend and token totals per day, team, key, model or end user over a window you can make as wide as a quarter (`--start/--end`), without downloading the log.
 - **Audit:**
-  - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database.
+  - `drift` compares the config.yaml in git with the running proxy, including models that exist only in its database and fallback rules set through the API.
   - `fleet diff` compares proxies behind one VIP.
   - `lint` checks a config against built-in hygiene rules and a site policy file.
 
@@ -50,6 +51,12 @@ cli-anything-litellm guardrails usage --days 30             # evaluated, blocked
 cli-anything-litellm guardrails logs prompt-injection --action blocked
 cli-anything-litellm guardrails add --name pii-mask --guardrail presidio --mode pre_call,post_call \
   --api-base http://presidio:3000 --api-key os.environ/PRESIDIO_KEY --dry-run
+cli-anything-litellm health latest                          # last recorded status per deployment; exit 2 if one is down (no backend called)
+cli-anything-litellm health history --model qwen --status unhealthy   # when did it go down?
+cli-anything-litellm models block qwen-b --yes              # pause one DB replica (says how many keep serving)
+cli-anything-litellm fallbacks set qwen --to gpt-4o,claude  # checked against live groups; refused if config.yaml owns the list
+cli-anything-litellm fallbacks test qwen                    # fail qwen on purpose: which fallback served? (one real completion)
+cli-anything-litellm models unblock qwen-b                  # back into rotation
 cli-anything-litellm drift --config litellm/config.yaml
 cli-anything-litellm lint --config litellm/config.yaml --policy litellm/policy.yaml
 cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:4000
@@ -57,4 +64,4 @@ cli-anything-litellm fleet diff --node https://gw-1:4000 --node https://gw-2:400
 
 See [`skills/cli-anything-litellm/SKILL.md`](skills/cli-anything-litellm/SKILL.md) for the command map and the proxy behaviours it accounts for.
 
-Tested against LiteLLM **v1.100.1**; the MCP (v0.10.0) and guardrail (v0.11.0) commands against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.
+Tested against LiteLLM **v1.100.1**; the MCP (v0.10.0), guardrail (v0.11.0) and routing-resilience (v0.12.0) commands against **v1.106.3**. See [`TEST.md`](TEST.md) for the test layout and results.
