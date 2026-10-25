@@ -273,7 +273,11 @@ def health(ctx, model):
 
 
 def _short(text: str | None, width: int = 100) -> str | None:
-    return text if not text or len(text) <= width else text[: width - 1] + "…"
+    """One table line: whitespace (newlines from upstream JSON bodies) collapsed, then cut."""
+    if not text:
+        return text
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def _health_note(r: dict) -> str:
@@ -642,32 +646,61 @@ def fallbacks_list(ctx, model, fallback_type):
     )
 
 
+def _resolve_chain(conn, model: str, fallback_type: str) -> dict[str, Any]:
+    """The effective chain for MODEL: from the proxy when it can answer, else from /router/settings.
+
+    ``GET /fallback/{model}`` 404s for every name holding ``/`` (the path
+    parameter does not match a slash) and for a model with no chain; either
+    way the chain is resolved locally, never reported as "none" off a 404.
+    """
+    if fb_mod.path_reachable(model):
+        try:
+            res = be.get(conn, fb_mod.fallback_path(model), params={"fallback_type": fallback_type}) or {}
+        except be.ApiError as e:
+            if e.status != 404:
+                raise _api_error(e) from e
+            reason = f"GET /fallback/{{model}} answered 404 ({e.message})"
+        else:
+            return {
+                "fallback_models": res.get("fallback_models") or [],
+                "resolved_by": "proxy",
+                "match": None,
+                "note": None,
+            }
+    else:
+        reason = "the name contains '/', which GET /fallback/{model} cannot match"
+    current = _call(_router_settings, conn).get("current_values") or {}
+    local = fb_mod.effective_chain(current.get(fb_mod.FIELDS[fallback_type]), model)
+    return {**local, "resolved_by": "router_settings", "reason": reason}
+
+
 @fallbacks_grp.command("show")
 @click.argument("model")
 @_fallback_type_option
 @click.pass_context
 def fallbacks_show(ctx, model, fallback_type):
-    """The chain the router would use for MODEL (GET /fallback/{model}).
+    """The chain the router would use for MODEL.
 
-    Resolved the router's way: MODEL's own rule, else a provider-prefixed
-    match, else the * catch-all.
+    Resolved the router's way: MODEL's own rule, else a provider-prefixed or
+    stripped match, else the * catch-all. Asks GET /fallback/{model} when it
+    can; for a name containing '/' (which that route cannot match) or a 404,
+    the chain is resolved locally from GET /router/settings (resolved_by).
     """
-    try:
-        res = be.get(_conn(ctx), fb_mod.fallback_path(model), params={"fallback_type": fallback_type}) or {}
-    except be.ApiError as e:
-        if e.status != 404:
-            raise _api_error(e) from e
-        res = {}
-    out = {
-        "model": model,
-        "fallback_type": fallback_type,
-        "fallback_models": res.get("fallback_models") or [],
-    }
-    _emit(
-        ctx,
-        out,
-        lambda r: click.echo(f"  {model} ({fallback_type}): {_chain_text(r['fallback_models'])}"),
-    )
+    out = {"model": model, "fallback_type": fallback_type, **_resolve_chain(_conn(ctx), model, fallback_type)}
+
+    def human(r):
+        if r["fallback_models"] or r["resolved_by"] == "proxy":
+            click.echo(f"  {model} ({fallback_type}): {_chain_text(r['fallback_models'])}")
+        else:
+            click.echo(f"  {model} ({fallback_type}): no rule in /router/settings applies")
+        if r["resolved_by"] != "proxy":
+            click.echo(
+                f"  resolved from /router/settings ({r['reason']}); match: {r['match'] or 'no rule applies'}"
+            )
+        if r.get("note"):
+            click.echo(f"  note: {r['note']}")
+
+    _emit(ctx, out, human)
 
 
 @fallbacks_grp.command("set")
@@ -725,11 +758,26 @@ def fallbacks_delete(ctx, model, fallback_type, yes):
     chain = held.get(model)
     if chain is None:
         raise click.ClickException(f"no {fallback_type} fallback rule for {model!r} (see `fallbacks list`)")
+    if not fb_mod.path_reachable(model):
+        raise click.ClickException(
+            f"cannot delete the {fallback_type} rule for {model!r}: DELETE /fallback/{{model}} does not match "
+            "a name containing '/' (the proxy answers 404 Not Found, escaped or not), so nothing was deleted. "
+            f"Remove it by rewriting router_settings.{fb_mod.FIELDS[fallback_type]} without this rule "
+            "(the DB copy: Admin UI router settings or POST /config/update), or, if config.yaml sets that "
+            "list, edit the config. `fallbacks set` can only replace the chain, not remove it."
+        )
     path = fb_mod.fallback_path(model)
     if _dry(ctx, "DELETE", f"{path}?fallback_type={fallback_type}"):
         return
     _confirm(ctx, yes, f"delete the {fallback_type} fallback rule {model} → {_chain_text(chain)}")
-    _call(be.delete, c, path, params={"fallback_type": fallback_type})
+    try:
+        be.delete(c, path, params={"fallback_type": fallback_type})
+    except be.ApiError as e:
+        if e.status == 404 and e.message == fb_mod.ROUTE_NOT_FOUND:
+            raise click.ClickException(
+                f"DELETE {path} reached no route (404 Not Found): nothing was deleted"
+            ) from e
+        raise _api_error(e) from e
     out = {
         "deleted": model,
         "fallback_type": fallback_type,
@@ -764,15 +812,11 @@ def fallbacks_test(ctx, model, fallback_type, text):
     unknown (exit 2). Chat model groups only.
     """
     c = _conn(ctx)
-    try:
-        got = be.get(c, fb_mod.fallback_path(model), params={"fallback_type": fallback_type}) or {}
-    except be.ApiError as e:
-        if e.status == 404:
-            raise click.ClickException(
-                f"no {fallback_type} fallbacks configured for {model!r}: nothing to test (see `fallbacks list`)"
-            ) from e
-        raise _api_error(e) from e
-    chain = got.get("fallback_models") or []
+    chain = _resolve_chain(c, model, fallback_type)["fallback_models"]
+    if not chain:
+        raise click.ClickException(
+            f"no {fallback_type} fallbacks apply to {model!r}: nothing to test (see `fallbacks show`)"
+        )
     body = fb_mod.probe_body(model, fallback_type, text)
     if _dry(ctx, "POST", "/v1/chat/completions", body):
         return

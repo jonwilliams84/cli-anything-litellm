@@ -18,7 +18,13 @@ The endpoints:
 - ``GET /fallback/{model}?fallback_type=`` (``get_fallback``): the chain the
   router would actually use for ``model`` (``get_all_fallbacks`` →
   ``get_fallback_model_group``: exact key, then a provider-prefixed or
-  stripped match, then the ``"*"`` catch-all). 404 when there is none.
+  stripped match, then the ``"*"`` catch-all). 404 when there is none —
+  AND for every model name containing ``/``, escaped or not: the route's
+  ``{model}`` path parameter does not match a slash, so FastAPI answers
+  404 ``{"detail": "Not Found"}`` before the handler runs (seen on the live
+  v1.106.3 proxy). The same holds for ``DELETE /fallback/{model}``.
+  :func:`effective_chain` resolves the chain locally from
+  ``/router/settings`` instead.
 - ``POST /fallback`` (``create_fallback``): body ``FallbackCreateRequest``
   ``{"model", "fallback_models", "fallback_type"}``. Replaces the model's rule
   of that type (or appends one), writes ``router_settings`` to the DB and sets
@@ -71,6 +77,89 @@ CATCH_ALL = "*"
 def fallback_path(model: str) -> str:
     """``/fallback/{model}`` with the name escaped (group names may hold ``/``)."""
     return f"/fallback/{quote(str(model), safe='')}"
+
+
+#: FastAPI's body when no route matched — what a slash in ``{model}`` gets.
+ROUTE_NOT_FOUND = "Not Found"
+
+
+def path_reachable(model: str) -> bool:
+    """False when ``/fallback/{model}`` can never reach the handler (the name holds ``/``)."""
+    return "/" not in str(model)
+
+
+def _raw_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return value if isinstance(value, list) else []
+
+
+def effective_chain(value: Any, model: str) -> dict[str, Any]:
+    """The chain the router would use for ``model``, resolved locally from a stored list.
+
+    Mirrors ``get_fallback_model_group`` (``router_utils/fallback_event_handlers.py``)
+    on the raw list: an exact key wins (first one, it breaks); otherwise the
+    last bare-string entry; otherwise a provider-prefixed key
+    (``<provider>/<model>``, for a model without ``/``) or a stripped key (the
+    part of ``model`` after its ``<provider>/`` prefix); otherwise ``*``.
+
+    Two steps depend on LiteLLM's provider list, which the CLI does not carry,
+    so they are reported, not asserted: ``match`` is ``provider_prefixed`` /
+    ``stripped`` and ``note`` names the condition the proxy checks.
+    Returns ``{"fallback_models", "match", "note"}``; ``match`` is ``None``
+    and the chain empty when nothing applies.
+    """
+    items = _raw_list(value)
+    keys = [next(iter(i)) for i in items if isinstance(i, dict) and i]
+    exact = bare = stripped = prefixed = None
+    stripped_key = prefixed_key = None
+    generic = None
+    for item in items:
+        if isinstance(item, dict) and item:
+            k = next(iter(item))
+            v = item[k]
+            chain = [str(x) for x in (v if isinstance(v, list) else [v]) if isinstance(x, str)]
+            if k == model:
+                exact = chain
+                break
+            if "/" in model and k == model.split("/", 1)[1]:
+                stripped, stripped_key = chain, k
+            elif "/" not in model and k.endswith(f"/{model}") and prefixed is None:
+                prefixed, prefixed_key = chain, k
+            elif k == CATCH_ALL:
+                generic = chain if generic is None else generic
+        elif isinstance(item, str):
+            bare = [item]
+    if exact is not None:
+        return {"fallback_models": exact, "match": "exact", "note": None}
+    if bare is not None:
+        return {
+            "fallback_models": bare,
+            "match": "bare",
+            "note": "a bare-string entry applies to every model",
+        }
+    if stripped is not None:
+        prefix = model.split("/", 1)[0]
+        return {
+            "fallback_models": stripped,
+            "match": "stripped",
+            "note": f"rule {stripped_key!r} applies only if {prefix!r} is a LiteLLM provider name"
+            + (f"; otherwise the * rule {generic} applies" if generic is not None else ""),
+        }
+    if prefixed is not None:
+        others = [k for k in keys if k.endswith(f"/{model}") and k != prefixed_key]
+        return {
+            "fallback_models": prefixed,
+            "match": "provider_prefixed",
+            "note": f"rule {prefixed_key!r} applies only if LiteLLM infers that provider for {model!r}"
+            + (f" (also candidates: {', '.join(others)})" if others else ""),
+        }
+    if generic is not None:
+        return {"fallback_models": generic, "match": "catch_all", "note": None}
+    return {"fallback_models": [], "match": None, "note": None}
 
 
 def rules(value: Any) -> dict[str, list[str]]:

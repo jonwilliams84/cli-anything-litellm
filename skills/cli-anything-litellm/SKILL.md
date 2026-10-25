@@ -58,8 +58,8 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | What did the proxy's own health checks last see? (free) | `health latest [--unhealthy]` — no backend called; `gone` = row outlived its deployment, `blocked` = paused, `unknown` = never checked; exit 2 if a live, unpaused deployment is unhealthy |
 | When did a backend go down / come back? | `health history [--model GROUP] [--status unhealthy] [--limit ≤1000] [--offset N]` — background checks record status CHANGES only |
 | Take one bad replica out of rotation (reversibly) | `models block <deployment-id> --yes` (DB deployments only; says how many replicas keep serving), `models unblock <id>`; `models list --deployments` shows PAUSED |
-| What happens when a group fails? | `fallbacks list [--model M] [--type general|context_window|content_policy]` (`SRC=config|db`), `fallbacks show <model>` (the effective chain, `*` catch-all included) |
-| Add / change / remove a fallback rule | `fallbacks set <model> --to a,b [--type T]`, `fallbacks delete <model> --yes` — refused when config.yaml owns that list |
+| What happens when a group fails? | `fallbacks list [--model M] [--type general|context_window|content_policy]` (`SRC=config|db`), `fallbacks show <model>` (the effective chain, `*` catch-all included; `resolved_by: proxy` or `router_settings` for names with `/`) |
+| Add / change / remove a fallback rule | `fallbacks set <model> --to a,b [--type T]`, `fallbacks delete <model> --yes` — refused when config.yaml owns that list; `delete` cannot address a name with `/` (see traps) |
 | Does the fallback chain actually serve? | `fallbacks test <model> [--type T]` — fails the primary on purpose (the router's mock flag); `failed_over` (exit 0) / `chain_failed` / `not_triggered` / `unknown` (exit 2). One REAL completion, logged and billed |
 | What models/replicas does it serve? | `models list` (`--deployments` for one row per replica; `SRC=db` = added via UI/API) |
 | Are replicas of one group interchangeable? | `models consistency` |
@@ -260,6 +260,17 @@ nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
   (needs `STORE_MODEL_IN_DB`) and survive restarts, but are not in git:
   `drift` reports each rule as `fallbacks.<model>` until the config says the
   same. Chains are compared rule by rule; order inside a chain matters.
+- **`/fallback/{model}` cannot address a name with `/`.** The route's path
+  parameter does not match a slash, escaped (`%2F`) or not: the proxy answers
+  404 `{"detail": "Not Found"}` for `ollama-cloud/glm-5.2` and similar names.
+  `fallbacks show` and `fallbacks test` therefore resolve the chain locally
+  from `/router/settings` for such names, and on any 404 (`resolved_by:
+  router_settings`). A `stripped` or `provider_prefixed` `match` carries a
+  `note`: the proxy applies it only if the prefix is a LiteLLM provider.
+  `fallbacks delete` refuses such names (nothing is sent). Remove the rule
+  by rewriting the DB list (Admin UI router settings or `POST
+  /config/update`), or in config.yaml if the config owns it. `fallbacks set`
+  is unaffected: the name goes in the body.
 - **`fallbacks test` costs one request.** It sends a chat completion with
   `mock_testing_fallbacks` (or the context-window / content-policy variant),
   so the primary is failed without touching it and a fallback answers. The

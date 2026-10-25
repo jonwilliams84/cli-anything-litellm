@@ -128,6 +128,31 @@ def test_chain_drift_rule_order_free_chain_order_strict_db_only_reported():
     assert fb.chain_drift({"fallbacks": "os.environ/FB"}, {"fallbacks": [{"a": ["b"]}]}) == []
 
 
+def test_effective_chain_mirrors_get_fallback_model_group():
+    stored = [
+        {"*": ["small"]},
+        {"glm-5.2": ["claude"]},
+        {"openai/gpt-4o": ["qwen"]},
+        {"ollama-cloud/glm-5.2": ["gpt-4o"]},
+    ]
+    assert fb.effective_chain(stored, "ollama-cloud/glm-5.2") == {
+        "fallback_models": ["gpt-4o"],
+        "match": "exact",
+        "note": None,
+    }
+    stripped = fb.effective_chain(stored, "hosted_vllm/glm-5.2")
+    assert stripped["match"] == "stripped" and stripped["fallback_models"] == ["claude"]
+    assert "'hosted_vllm' is a LiteLLM provider" in stripped["note"] and "['small']" in stripped["note"]
+    prefixed = fb.effective_chain(stored, "gpt-4o")
+    assert prefixed["match"] == "provider_prefixed" and prefixed["fallback_models"] == ["qwen"]
+    assert fb.effective_chain(stored, "nothing")["match"] == "catch_all"
+    assert fb.effective_chain([{"a": ["b"]}], "z") == {"fallback_models": [], "match": None, "note": None}
+    assert fb.effective_chain(["small", {"a": ["b"]}], "a")["match"] == "exact"  # exact beats bare
+    assert fb.effective_chain(["x", "y"], "a")["fallback_models"] == ["y"]  # last bare string wins
+    assert fb.effective_chain('[{"a": ["b"]}]', "a")["fallback_models"] == ["b"]
+    assert fb.path_reachable("qwen") and not fb.path_reachable("ollama-cloud/glm-5.2")
+
+
 def test_probe_body_sets_the_routers_mock_flag():
     assert fb.probe_body("qwen", "general", "hi") == {
         "model": "qwen",
@@ -166,6 +191,7 @@ def test_probe_verdict():
 
 
 def test_fallback_path_escapes_slashes():
+    # escaping does not help: the route still 404s (see path_reachable)
     assert fb.fallback_path("openai/gpt-4o") == "/fallback/openai%2Fgpt-4o"
 
 
@@ -317,7 +343,10 @@ def proxy(deps=None, settings=None, chains=None, latest_rows=None, history_rows=
         if p == "/router/settings":
             return settings
         if p.startswith("/fallback/"):
-            model = p.split("/", 2)[2].replace("%2F", "/")
+            if "%2F" in p or p.count("/") > 2:
+                # FastAPI: `{model}` does not match a slash, escaped or not
+                raise be.ApiError(404, fb.ROUTE_NOT_FOUND, "http://p" + p)
+            model = p.split("/", 2)[2]
             ftype = (k.get("params") or {}).get("fallback_type", "general")
             if (model, ftype) not in chains:
                 raise be.ApiError(404, no_fallback_text(model, ftype), "http://p" + p)
@@ -396,6 +425,22 @@ def test_health_history_query_paging_hint_and_redaction():
     no_secret(r.output)
     rows = json.loads(run(["--json", "health", "history"]).output)
     assert [x["status"] for x in rows] == ["unhealthy", "healthy", "healthy"]
+
+
+def test_health_tables_keep_multiline_errors_on_one_line():
+    gemini = 'litellm.BadRequestError: GeminiException - {\n  "error": {\n    "code": 400,\n    "message": "API key not valid"\n  }\n}'
+    rows = [health_row("gemini", "gem-1", "unhealthy", error=gemini)]
+    deps = [deployment("gem-1", "gemini")]
+    for args, get in (
+        (["health", "latest"], proxy(deps=deps, latest_rows=rows)),
+        (["health", "history"], proxy(deps=deps, history_rows=rows)),
+    ):
+        r = run(args, get=get)
+        lines = [ln for ln in r.output.splitlines() if ln.strip()]
+        assert len(lines) == 2, r.output  # header + one row
+        assert '{ "error": { "code": 400,' in lines[1]
+    out = json.loads(run(["--json", "health", "history"], get=proxy(deps=deps, history_rows=rows)).output)
+    assert "\n" in out[0]["error"]  # --json keeps the full (masked) text
 
 
 def test_health_history_limit_refused_before_the_proxy():
@@ -501,13 +546,50 @@ def test_fallbacks_list_table_and_json():
     assert rows == [{"model": "qwen", "type": "context_window", "fallbacks": ["claude"], "source": "config"}]
 
 
-def test_fallbacks_show_effective_chain_and_none():
+def test_fallbacks_show_from_the_proxy_when_it_can_answer():
     get = proxy(chains={("qwen", "general"): ["gpt-4o", "claude"]})
     out = json.loads(run(["--json", "fallbacks", "show", "qwen"], get=get).output)
-    assert out == {"model": "qwen", "fallback_type": "general", "fallback_models": ["gpt-4o", "claude"]}
+    assert out == {
+        "model": "qwen",
+        "fallback_type": "general",
+        "fallback_models": ["gpt-4o", "claude"],
+        "resolved_by": "proxy",
+        "match": None,
+        "note": None,
+    }
     assert ("/fallback/qwen", {"fallback_type": "general"}) in get.calls
+
+
+SLASHED = router_settings(
+    {"fallbacks": [{"ollama-cloud/glm-5.2": ["gpt-4o"]}, {"*": ["small"]}]}, {"fallbacks": "config"}
+)
+
+
+def test_fallbacks_show_slash_name_resolves_locally_never_none():
+    # live v1.106.3: GET /fallback/ollama-cloud%2Fglm-5.2 → 404 {"detail": "Not Found"}
+    get = proxy(settings=SLASHED)
+    r = run(["--json", "fallbacks", "show", "ollama-cloud/glm-5.2"], get=get)
+    out = json.loads(r.output)
+    assert r.exit_code == 0 and out["fallback_models"] == ["gpt-4o"]
+    assert out["resolved_by"] == "router_settings" and out["match"] == "exact"
+    assert not any(p.startswith("/fallback/") for p, _ in get.calls)  # unreachable: not even tried
+    r = run(["fallbacks", "show", "ollama-cloud/glm-5.2"], get=proxy(settings=SLASHED))
+    assert "gpt-4o" in r.output and "(none)" not in r.output and "contains '/'" in r.output
+
+
+def test_fallbacks_show_404_falls_back_to_router_settings():
+    # a route-level 404 (the real body) or a "no chain" 404: resolve locally either way
+    def get(c, p, **k):
+        if p.startswith("/fallback/"):
+            raise be.ApiError(404, fb.ROUTE_NOT_FOUND, "http://p" + p)
+        return proxy(settings=SETTINGS)(c, p, **k)
+
+    out = json.loads(run(["--json", "fallbacks", "show", "qwen"], get=get).output)
+    assert out["fallback_models"] == ["gpt-4o", "claude"] and out["resolved_by"] == "router_settings"
+    out = json.loads(run(["--json", "fallbacks", "show", "gpt-4o"], get=get).output)
+    assert out["fallback_models"] == ["small"] and out["match"] == "catch_all"
     r = run(["fallbacks", "show", "gpt-4o", "--type", "content_policy"], get=get)
-    assert r.exit_code == 0 and "(none)" in r.output
+    assert r.exit_code == 0 and "(none)" not in r.output and "no rule in /router/settings applies" in r.output
 
 
 def test_fallbacks_show_other_errors_are_errors():
@@ -589,6 +671,31 @@ def test_fallbacks_delete_gating_dry_run_and_catch_all_note():
     }
 
 
+def test_fallbacks_delete_slash_name_refused_never_success():
+    dele = mock.Mock()
+    settings = router_settings({"fallbacks": [{"ollama-cloud/glm-5.2": ["gpt-4o"]}]}, {"fallbacks": "db"})
+    for extra in ([], ["--yes"], ["--json", "--yes"]):
+        args = (["--json"] if "--json" in extra else []) + ["fallbacks", "delete", "ollama-cloud/glm-5.2"]
+        r = run(args + [x for x in extra if x != "--json"], get=proxy(settings=settings), delete=dele)
+        assert r.exit_code == 1 and "nothing was deleted" in r.output and "POST /config/update" in r.output
+        assert "deleted ollama" not in r.output
+    r = run(
+        ["--dry-run", "fallbacks", "delete", "ollama-cloud/glm-5.2"],
+        get=proxy(settings=settings),
+        delete=dele,
+    )
+    assert r.exit_code == 1 and "dry_run" not in r.output
+    dele.assert_not_called()
+
+
+def test_fallbacks_delete_route_404_is_not_success():
+    def dele(c, p, **k):
+        raise be.ApiError(404, fb.ROUTE_NOT_FOUND, "http://p" + p)
+
+    r = run(["fallbacks", "delete", "qwen", "--yes"], get=proxy(settings=SETTINGS), delete=dele)
+    assert r.exit_code == 1 and "nothing was deleted" in r.output and "deleted qwen" not in r.output
+
+
 def test_fallbacks_delete_unknown_and_config_owned_refused():
     dele = mock.Mock()
     get = proxy(settings=SETTINGS)
@@ -637,7 +744,7 @@ def test_fallbacks_test_not_triggered_and_chain_failed_exit_2():
 
 def test_fallbacks_test_without_chain_or_with_bad_key_is_an_error():
     post = mock.Mock()
-    r = run(["fallbacks", "test", "gpt-4o"], get=proxy(), post=post)
+    r = run(["fallbacks", "test", "gpt-4o"], get=proxy(), post=post)  # 404 and nothing in router settings
     assert r.exit_code == 1 and "nothing to test" in r.output
     post.assert_not_called()
 
@@ -646,6 +753,20 @@ def test_fallbacks_test_without_chain_or_with_bad_key_is_an_error():
 
     r = run(["fallbacks", "test", "qwen"], get=proxy(chains={("qwen", "general"): ["gpt-4o"]}), post=bad)
     assert r.exit_code == 1 and "chain_failed" not in r.output
+
+
+def test_fallbacks_test_slash_name_takes_its_chain_from_router_settings():
+    deps = [*DEPLOYMENTS, deployment("glm-1", "ollama-cloud/glm-5.2")]
+    get = proxy(deps=deps, settings=SLASHED)
+
+    def post(c, p, body=None, response_headers=None, **k):
+        assert body["model"] == "ollama-cloud/glm-5.2"
+        response_headers.update(completion_headers("gpt-1", 1))
+        return COMPLETION
+
+    r = run(["--json", "fallbacks", "test", "ollama-cloud/glm-5.2"], get=get, post=post)
+    out = json.loads(r.output)
+    assert r.exit_code == 0 and out["verdict"] == "failed_over" and out["chain"] == ["gpt-4o"]
 
 
 def test_fallbacks_test_dry_run_sends_no_completion():
@@ -797,3 +918,29 @@ class TestResilienceSubprocess:
     def test_history_bound_refused_without_a_proxy(self):
         r = self._run(["health", "history", "--limit", "0"])
         assert r.returncode == 1 and "1..1000" in r.stderr
+
+
+def test_slash_named_groups_ride_in_bodies_and_queries():
+    """Only /fallback/{model} puts a group name in the path; every other new call
+    sends it in a body or a query string, where '/' is fine."""
+    deps = [
+        *DEPLOYMENTS,
+        deployment("glm-1", "ollama-cloud/glm-5.2"),
+        deployment("glm-2", "ollama-cloud/glm-5.2"),
+    ]
+    get = proxy(deps=deps, settings=router_settings({}))
+    post = mock.Mock(side_effect=lambda c, p, body=None, **k: fallback_created(body))
+    r = run(["--json", "fallbacks", "set", "ollama-cloud/glm-5.2", "--to", "gpt-4o"], get=get, post=post)
+    assert r.exit_code == 0 and post.call_args.args[1:] == (
+        "/fallback",
+        {"model": "ollama-cloud/glm-5.2", "fallback_models": ["gpt-4o"], "fallback_type": "general"},
+    )
+    r = run(["health", "history", "--model", "ollama-cloud/glm-5.2"], get=get)
+    assert r.exit_code == 0
+    assert ("/health/history", {"limit": 50, "offset": 0, "model": "ollama-cloud/glm-5.2"}) in get.calls
+    post = mock.Mock(return_value=blocked_row("glm-1", "ollama-cloud/glm-5.2", True))
+    r = run(["--json", "models", "block", "glm-1", "--yes"], get=get, post=post)
+    assert r.exit_code == 0 and post.call_args.args[1:] == ("/model/block", {"model_id": "glm-1"})
+    assert json.loads(r.output)["serving_replicas"] == 1
+    r = run(["models", "block", "ollama-cloud/glm-5.2", "--yes"], get=get, post=post)
+    assert r.exit_code == 1 and "glm-1, glm-2" in r.output  # group name → the ids, not a path

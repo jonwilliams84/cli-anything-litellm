@@ -16,18 +16,30 @@ database and never showed up anywhere. Now (shapes from v1.106.3):
   (`general`, `context_window`, `content_policy`), from `GET /router/settings`,
   with who owns it (`SRC=config|db`).
 - **`fallbacks show <model> [--type T]`**: the chain the router would actually
-  use (`GET /fallback/{model}`: the model's own rule, then a provider-prefixed
-  match, then the `*` catch-all).
+  use: the model's own rule, then a provider-prefixed or stripped match, then
+  the `*` catch-all. It asks `GET /fallback/{model}` only when it can. That
+  route 404s (`{"detail": "Not Found"}`) for **every name containing `/`**,
+  escaped or not, because the `{model}` path parameter doesn't match a slash,
+  and most groups on a typical estate have one (`ollama-cloud/glm-5.2`). For
+  those, and on any 404, the chain is resolved locally from
+  `GET /router/settings` the same way (`resolved_by: router_settings`, with
+  `match`, and a `note` where the result depends on LiteLLM's provider list).
+  A 404 is never reported as "(none)".
 - **`fallbacks set <model> --to a,b [--type T]`** (`POST /fallback`): every
   name is checked against the live model groups first. The output names the
   chain it replaced.
   **`fallbacks delete <model> --yes`** (`DELETE /fallback/{model}`): the output
-  says whether a `*` rule still covers the model.
+  says whether a `*` rule still covers the model. For a name containing `/`
+  the route can't be reached, so `delete` refuses (exit 1, nothing sent) and
+  names the alternatives: rewrite the DB list through the Admin UI router
+  settings or `POST /config/update`, or edit config.yaml if it owns the list.
+  A route-level 404 is never reported as a deletion.
   Both refuse a list that config.yaml sets. The config owns those lists
   (`config_ownership_message`, `config_resolvers/settings_store.py`), so the
   proxy would change only the worker that answered, keep reporting the config
   value, and lose the change on restart.
-- **`fallbacks test <model> [--type T]`**: fails the primary on purpose with
+- **`fallbacks test <model> [--type T]`**: takes the chain the same way as
+  `show` (so slash-named groups work), then fails the primary on purpose with
   the router's own `mock_testing_*fallbacks` flag
   (`Router._handle_mock_testing_fallbacks`) and reports which group served,
   from the `x-litellm-model-id` header. Verdicts are `failed_over` (exit 0),
@@ -45,7 +57,9 @@ database and never showed up anywhere. Now (shapes from v1.106.3):
   deployment (`GET /health/latest`). No backend is called. Rows are joined to
   the live deployments: `gone` (the row outlived its deployment), `blocked`,
   and `unknown` for a deployment never checked. Exit 2 when a live, unpaused
-  deployment is unhealthy.
+  deployment is unhealthy. In table output, multi-line upstream errors (a
+  provider's JSON body, for instance) are collapsed to one line before they're
+  cut; `--json` keeps the full masked text.
 - **`health history [--model M] [--status S] [--limit ≤1000] [--offset N]`**
   (`GET /health/history`): recorded checks, newest first. Background checks
   record only status changes (`save_background_health_checks_to_db`), so this
@@ -78,7 +92,7 @@ compares fallback chains, and `core/backend.py` can return response headers
 over the mocked proxy, drift/fleet, two workflows, the installed command via
 `_resolve_cli`), with fixtures in `tests/resilience_fixtures.py`, each citing
 the v1.106.3 function it reproduces. Docs: README, `TEST.md`, `CLAUDE.md` and
-the SKILL (both copies). (v0.12.0: 366 tests, 94% coverage.)
+the SKILL (both copies). (v0.12.0: 374 tests, 94% coverage.)
 
 ## [0.11.0] — 2026-10-25
 

@@ -338,15 +338,28 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/guardrail_fixtures.py`):
   unpaused) and ungated.
 - `fallbacks list`: rows from all three lists with `source`, filtered by
   type or by model (own rule plus `*`). `router show` includes the lists.
-- `fallbacks show`: `GET /fallback/{model}` with `fallback_type`. A 404 means
-  "(none)"; any other error is an error.
+- `fallbacks show`: `GET /fallback/{model}` with `fallback_type` when the
+  name has no `/` (`resolved_by: proxy`). For a slash-named group, the route
+  isn't even tried. On a 404 (the real `{"detail": "Not Found"}` body) the
+  chain is resolved locally from `/router/settings`
+  (`core/fallbacks.effective_chain`: exact, bare, stripped, provider-prefixed,
+  `*`). A 404 never prints "(none)". Any other error is an error.
+- `fallbacks delete` of a slash-named group: exit 1, nothing sent (with or
+  without `--yes`, and under `--dry-run`), and the alternatives named. A
+  route-level 404 from `DELETE` is an error, never "deleted".
+- Slash-named groups in bodies and queries (`fallbacks set`, `health history
+  --model`, `models block` by id) are unaffected. A slash-named group name
+  given to `models block` is refused with its ids.
+- `health latest` / `health history` tables keep a multi-line upstream error
+  on one row; `--json` keeps the newlines.
 - `fallbacks set`: the exact dry-run body, the replaced chain in the output,
   and refusals before the proxy for unknown groups, self-fallback and
   config-owned lists. The proxy's `STORE_MODEL_IN_DB` 400 surfaces.
 - `fallbacks delete`: `--yes` gate, a dry-run with the query, the `*`
   catch-all that still covers the model named, and unknown or config-owned
   rules refused.
-- `fallbacks test`: the mock flag per type, `failed_over` (exit 0) from the
+- `fallbacks test`: the chain is resolved like `show` (a slash-named group
+  is tested off its `/router/settings` rule), the mock flag per type, `failed_over` (exit 0) from the
   `x-litellm-model-id` header, `not_triggered` and `chain_failed` (exit 2,
   error redacted), no chain → an error with no completion sent, 401 → an
   error rather than a verdict, and dry-run sends nothing.
@@ -358,6 +371,6 @@ Fixtures reproduce LiteLLM v1.106.3 (`tests/guardrail_fixtures.py`):
 
 ## Results
 
-`pytest tests --cov=cli_anything --cov-fail-under=70 -q`: 366 passed, 94% coverage (v0.12.0; `core/fallbacks.py` and `core/health.py` 100%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, and so are `tests/test_resilience.py` and `tests/resilience_fixtures.py`, along with the MCP and guardrail test files. A repo-wide `ruff check .` (ruff 0.17.2) still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
+`pytest tests --cov=cli_anything --cov-fail-under=70 -q`: 374 passed, 94% coverage (v0.12.0; `core/fallbacks.py` 99%, `core/health.py` 100%). `ruff check cli_anything/` and `ruff format --check cli_anything/` (the CI scope) are clean, and so are `tests/test_resilience.py` and `tests/resilience_fixtures.py`, along with the MCP and guardrail test files. A repo-wide `ruff check .` (ruff 0.17.2) still reports the 44 findings in `tests/test_core.py` / `tests/test_full_e2e.py` that predate this release, and `ruff format --check .` the same 5 files as main.
 
 (v0.11.0: 310 passed, 92%. v0.10.0: 262 passed, 90.3%. v0.9.0: 190 passed, 87.9% coverage.)
