@@ -1,8 +1,62 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] — 2026-10-25
+
+The MCP gateway: the proxy's other half, from the shell.
+
+A LiteLLM proxy fronts MCP servers the way it fronts model deployments: one
+MCP endpoint, every server's tools behind it as `<server>-<tool>`, access
+decided per key by `object_permission` (`mcp_access_groups`,
+`mcp_servers`). The CLI covered models, keys, spend and drift but not one
+`/v1/mcp/*` route, so "is the grafana MCP server up", "which keys lose those
+tools if it is not", "grant this key the home group" and "add a server"
+meant the Admin UI or hand-written curl. Now (shapes from v1.106.3,
+`litellm/proxy/management_endpoints/mcp_management_endpoints.py`):
+
+- **`mcp list [--health]`** — every server: name (the tool prefix), source
+  (`config` from config.yaml, read-only through the API, or `db`),
+  transport, auth type, URL origin, access groups, health on request.
+- **`mcp health [SERVER...]`** — `GET /v1/mcp/server/health`; exit 2 when
+  any server is unhealthy, unhealthy ones listed first.
+- **`mcp info <id|alias|name>`** — the full record (the proxy health-checks
+  it live), redacted.
+- **`mcp tools [--server S]`** — the tools the calling key sees, attributed
+  to servers, with the servers' read-only/destructive hints.
+- **`mcp groups`** — each access group and its servers, plus servers open to
+  every key (`allow_all_keys`).
+- **`mcp access [--server S] [--team T]`** — which keys reach which servers
+  through their own grant (groups ∪ named servers ∪ `allow_all_keys`); keys
+  with no grant of their own are shown as inherited, not guessed.
+- **`mcp add` / `mcp update` / `mcp delete`** — DB servers via
+  `POST|PUT /v1/mcp/server` and `DELETE /v1/mcp/server/{id}`. `add` defaults
+  `--transport http` (the proxy defaults to `sse`), refuses stdio (it runs a
+  process on the proxy host) and names with `-` (the tool separator) before
+  the proxy does. `update` sends only the flags given: the endpoint is a
+  partial update where a null clears a field. Config servers are refused
+  with a pointer to the config. `delete` is `--yes`-gated and names the keys
+  still holding an explicit grant to the deleted id (the proxy leaves them).
+- **`mcp sessions` / `mcp sessions-close --user U|--prefix P`** — live
+  stateful gateway sessions, per worker process; closing is `--yes`-gated.
+- **`keys generate|update --mcp-groups g1,g2 --mcp-servers s1`** — set a
+  key's MCP grant (`none` = the proxy's opt-out sentinel). Groups are
+  checked against `/v1/mcp/access_groups` and server refs resolved to ids
+  before the proxy is called. The proxy merges `object_permission` per field,
+  so the key's other grants survive. `keys list --json` rows gain `mcp`.
+
+### Security
+- MCP server records carry upstream secrets outside `credentials`: in the
+  URL (path or query), `static_headers`, `env`/`env_vars` and stdio `args`.
+  Every MCP output cuts URLs to their origin, masks header/env values, and
+  lists credential fields by name only. MCP credentials have no
+  `os.environ/` indirection on the proxy, so `--auth-value-env VAR` reads the
+  secret from the CLI's environment rather than argv, and `--dry-run`
+  prints it masked.
 
 ### Fixed
+- `keys rotate` dropped the key's `object_permission` — its MCP servers and
+  access groups, vector stores and agents — so the replacement key silently
+  lost every one of those grants. It now copies the grant (not the old key's
+  permission row id, which would make the two keys share one row).
 - `spend`, `logs list` and `logs summary` now page through `/spend/logs/v2` (100 rows a page,
   without prompt and response columns). The unpaged `/spend/logs?summarize=false` loaded every
   row, prompts included, into the proxy: a 3-day window OOM-killed both pods of a 2Gi v1.106.3
@@ -13,6 +67,13 @@
   instead of the key's sha256, so both names now map to `(master key)`.
 - Log timestamps were off by the local UTC offset outside UTC (an hour on BST). The proxy
   writes `startTime` as naive UTC, which `astimezone()` read as local time.
+
+Core: `core/mcp.py`; `core/backend.py` gains `put` and `delete`. Tests:
+`tests/test_mcp.py` (69: core units, CLI over the mocked proxy, two
+workflows, the installed command via `_resolve_cli`) with fixtures in `tests/mcp_fixtures.py`, each citing the
+v1.106.3 function whose response it reproduces (the server row also checked
+against a live v1.106.3 proxy). Docs: README, `TEST.md`, `CLAUDE.md` and the
+SKILL (both copies). (v0.10.0: 262 tests, 90.3% coverage.)
 
 ## [0.9.0] — 2026-10-24
 
