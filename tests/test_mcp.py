@@ -400,18 +400,87 @@ def test_mcp_access_maps_keys_to_servers_and_filters():
         key("cloudroom", permission(groups=["devtools"])),
         key("rufus", permission(groups=["devtools", "home"])),
         key("ha-only", permission(servers=[HA])),
-        key("legacy"),
+        key("team-key", team="team-eng"),
     ]
     r = run(["--json", "mcp", "access"], get=proxy(keys=keys))
     rows = {x["key_alias"]: x for x in json.loads(r.output)["keys"]}
     assert rows["cloudroom"]["reaches"] == ["context7", "grafana", "kubernetes"]
     assert rows["rufus"]["reaches"] == ["context7", "grafana", "ha", "kubernetes"]
     assert rows["ha-only"]["servers"] == ["ha"] and rows["ha-only"]["reaches"] == ["ha"]
-    assert rows["legacy"]["reaches"] is None
+    assert rows["team-key"]["reaches"] is None and rows["team-key"]["inherits_from"] == ["team:team-eng"]
     r = run(["--json", "mcp", "access", "--server", "ha"], get=proxy(keys=keys))
     assert [x["key_alias"] for x in json.loads(r.output)["keys"]] == ["rufus", "ha-only"]
     r = run(["mcp", "access"], get=proxy(keys=keys))
-    assert "(inherited)" in r.output
+    assert "(inherited: team:team-eng)" in r.output
+
+
+def _users_get(users, keys, servers=None):
+    """proxy() plus /user/get_users (``get_users`` in internal_user_endpoints.py:
+    ``{"users": [...], "total": n, "page": p, "page_size": s, "total_pages": t}``)."""
+    base = proxy(keys=keys, servers=servers)
+
+    def get(c, p, **k):
+        if p == "/user/get_users":
+            return {"users": users, "total": len(users), "page": 1, "page_size": 100, "total_pages": 1}
+        return base(c, p, **k)
+
+    return get
+
+
+def test_mcp_access_default_deny_key_shows_none_not_inherited():
+    """Reviewer pin (round 1): no grant, no team, no org, no admin owner → the
+    gateway answers 403 "The key has no MCP servers granted"
+    (_raise_if_initialize_grants_no_mcp_servers, mcp_server/operations.py)."""
+    k = {**key("orphan"), "user_id": "bob"}
+    users = [{"user_id": "bob", "user_role": "internal_user"}]
+    r = run(["--json", "mcp", "access"], get=_users_get(users, [k]))
+    row = json.loads(r.output)["keys"][0]
+    assert row["reaches"] == [] and row["inherits_from"] == []
+    r = run(["mcp", "access"], get=_users_get(users, [k]))
+    assert "(none)" in r.output and "inherited" not in r.output
+
+
+def test_mcp_access_default_deny_key_still_reaches_allow_all_keys_servers():
+    servers = [*SERVERS, mcp_server("pub", "public_docs", groups=(), allow_all_keys=True)]
+    r = run(["--json", "mcp", "access"], get=_users_get([], [key("orphan")], servers=servers))
+    assert json.loads(r.output)["keys"][0]["reaches"] == ["public_docs"]
+
+
+def test_mcp_access_admin_owner_or_org_keeps_inherited():
+    admin = {**key("admin-key"), "user_id": "jon"}
+    org = {**key("org-key"), "organization_id": "org-1"}
+    users = [{"user_id": "jon", "user_role": "proxy_admin"}]
+    rows = {
+        x["key_alias"]: x
+        for x in json.loads(run(["--json", "mcp", "access"], get=_users_get(users, [admin, org])).output)[
+            "keys"
+        ]
+    }
+    assert rows["admin-key"]["reaches"] is None and rows["admin-key"]["inherits_from"] == ["role:proxy_admin"]
+    assert rows["org-key"]["inherits_from"] == ["org:org-1"]
+
+
+def test_mcp_access_unreadable_users_does_not_claim_admin():
+    from cli_anything.litellm.core import backend as be
+
+    k = {**key("orphan"), "user_id": "bob"}
+    base = proxy(keys=[k])
+
+    def get(c, p, **kw):
+        if p == "/user/get_users":
+            raise be.ApiError(403, "forbidden", "http://p" + p)
+        return base(c, p, **kw)
+
+    r = run(["--json", "mcp", "access"], get=get)
+    assert r.exit_code == 0 and json.loads(r.output)["keys"][0]["reaches"] == []
+
+
+def test_mcp_inherit_sources_and_reach_label():
+    assert mcpc.inherit_sources({"team_id": "t"}, {}) == ["team:t"]
+    assert mcpc.inherit_sources({"user_id": "u"}, {"u": "proxy_admin_viewer"}) == ["role:proxy_admin_viewer"]
+    assert mcpc.inherit_sources({"user_id": "u"}, {"u": "internal_user"}) == []
+    assert mcpc.reach_label(None, ["team:t"]) == "(inherited: team:t)"
+    assert mcpc.reach_label([], []) == "(none)" and mcpc.reach_label(["a", "b"], []) == "a,b"
 
 
 def test_mcp_add_dry_run_masks_credential_and_sends_nothing(monkeypatch):
@@ -830,3 +899,29 @@ class TestMcpSubprocess:
     def test_mcp_list_unreachable_proxy_fails_loudly(self):
         r = self._run(["mcp", "list"])
         assert r.returncode != 0 and "127.0.0.1:9" in (r.stdout + r.stderr) and "Traceback" not in r.stderr
+
+
+def test_users_list_falls_back_to_user_list_on_v1_106():
+    """v1.106.3 serves GET /user/list (UserListResponse, internal_user_endpoints.get_users);
+    /user/get_users 404s there."""
+    from cli_anything.litellm.core import backend as be
+
+    seen = []
+
+    def get(c, p, **k):
+        seen.append((p, k.get("params")))
+        if p == "/user/get_users":
+            raise be.ApiError(404, "Not Found", "http://p" + p)
+        if p == "/user/list":
+            return {
+                "users": [{"user_id": "jon", "user_role": "proxy_admin", "teams": []}],
+                "total": 1,
+                "page": 1,
+                "page_size": 100,
+                "total_pages": 1,
+            }
+        return {}
+
+    r = run(["--json", "users", "list"], get=get)
+    assert r.exit_code == 0 and json.loads(r.output)[0]["user_id"] == "jon"
+    assert ("/user/list", {"page": 1, "page_size": 100}) in seen

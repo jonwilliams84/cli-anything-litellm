@@ -435,6 +435,43 @@ def effective_servers(grant: dict[str, Any], servers: list[dict[str, Any]]) -> l
     return sorted(out)
 
 
+#: Roles ``user_api_key_has_admin_view`` (``proxy/_types.py``) treats as admin:
+#: with no explicit ``mcp_servers`` scope they resolve the whole registry
+#: (``MCPRequestHandler.admin_view_unscoped``).
+ADMIN_ROLES = ("proxy_admin", "proxy_admin_viewer")
+
+
+def inherit_sources(k: dict[str, Any], user_roles: dict[str, str | None]) -> list[str]:
+    """Where a key with no MCP grant of its own could still get servers from.
+
+    v1.106.3 resolves key ∪ team (a key with no servers inherits its team's),
+    lets an admin-view role resolve every server, and lets an organisation's
+    list become the ceiling when nothing lower restricts
+    (``get_mcp_server_access`` / ``_apply_primary_org_ceiling`` in
+    ``proxy/_experimental/mcp_server/auth/user_api_key_auth_mcp.py``). With none
+    of these the gateway is default-deny: initialize answers 403 "The key has
+    no MCP servers granted" (``_raise_if_initialize_grants_no_mcp_servers`` in
+    ``.../mcp_server/operations.py``). ``allow_all_keys`` servers are counted
+    separately by :func:`effective_servers`.
+    """
+    out = []
+    if k.get("team_id"):
+        out.append(f"team:{k['team_id']}")
+    if k.get("organization_id"):
+        out.append(f"org:{k['organization_id']}")
+    role = user_roles.get(k.get("user_id")) if k.get("user_id") else None
+    if role in ADMIN_ROLES:
+        out.append(f"role:{role}")
+    return out
+
+
+def reach_label(reaches: list[str] | None, sources: list[str]) -> str:
+    """`mcp access` REACHES column: servers, ``(inherited: …)`` or ``(none)``."""
+    if reaches is not None:
+        return ",".join(reaches) or "(none)"
+    return f"(inherited: {', '.join(sources)})" if sources else "(none)"
+
+
 def grant_permission(
     servers: list[dict[str, Any]],
     known_groups: list[str],

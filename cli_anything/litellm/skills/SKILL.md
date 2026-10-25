@@ -16,7 +16,9 @@ description: >-
   could not carry); the MCP gateway — MCP servers the proxy fronts (list,
   health, tools, access groups, add/update/delete DB servers, live gateway
   sessions) and which keys reach which servers (keys --mcp-groups/--mcp-servers,
-  mcp access).
+  mcp access); guardrails — list config and DB guardrails, add/update/delete
+  DB ones, test one on a text, usage (evaluated/blocked/fail rate per
+  guardrail), the requests a guardrail judged, and the team submission queue.
   Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
@@ -53,7 +55,11 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | What models/replicas does it serve? | `models list` (`--deployments` for one row per replica; `SRC=db` = added via UI/API) |
 | Are replicas of one group interchangeable? | `models consistency` |
 | What is the router actually doing? | `router show` (`--all` for every field) |
-| Which guardrails are loaded, for whom? | `guardrails list` |
+| Which guardrails are loaded, for whom? | `guardrails list` (config.yaml — what `drift` compares), `guardrails list --all` (+ DB guardrails, `SRC=config|db`, ids), `guardrails info <id|name>` (secrets masked) |
+| Does a guardrail do what I think? | `guardrails test <name> --text '...'` (or stdin) — passed / modified (prints the rewrite) / blocked (exit 3). A real request: logged, may cost on a paid guardrail service |
+| Are guardrails firing too much? | `guardrails usage [--days 7 | --start --end]` (exit 2 if one is `critical`, >15% blocked), `guardrails usage <name>` (daily series), `guardrails logs <name> [--action blocked] [--snippets]` |
+| Add / change / remove a DB guardrail | `guardrails add --name N --guardrail presidio --mode pre_call[,post_call] [--default-on] [--api-base U] [--api-key os.environ/VAR] [--param k=v]`, `guardrails update <name> --no-default-on`, `guardrails delete <name> --yes` |
+| Team guardrail submissions | `guardrails submissions [--status pending_review]`, `guardrails approve <id> --yes`, `guardrails reject <id>` |
 | **Does the live proxy match git?** | `drift --config path/to/config.yaml` (exit 2 = drift) |
 | **Would this config change break a recorded decision?** | `lint --config … --policy policy.yaml` (exit 1 = errors) |
 | **Are the nodes behind the VIP identical?** | `fleet diff --node URL1 --node URL2` (exit 2 = differ) |
@@ -80,7 +86,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M|--tag T] [--days 7]` |
 | MCP: which servers does the gateway front, are they up? | `mcp list [--health]` (`SRC=config` = config.yaml, read-only here; `db` = added via API/UI), `mcp health [SERVER...]` (exit 2 = one is unhealthy), `mcp info <id|alias|name>` (secrets redacted) |
 | MCP: what tools does a client see? | `mcp tools [--server S]` — for the key the CLI runs as; `mcp groups` — each access group and its servers |
-| MCP: which keys reach which servers? | `mcp access [--server S] [--team T]` — from each key's own `object_permission`; `reaches: null` = inherited from team/role |
+| MCP: which keys reach which servers? | `mcp access [--server S] [--team T]` — from each key's own `object_permission`; `(inherited: team:…/org:…/role:…)` only where one could grant servers, otherwise `(none)` (the gateway denies such a key) |
 | MCP: grant / revoke a key's servers | `keys generate|update K --mcp-groups devtools,home` / `--mcp-servers ha,grafana` (`none` = no MCP at all; `''` clears groups) |
 | MCP: add / change / remove a DB server | `mcp add --name N --url U [--alias A] [--access-groups g] [--auth-type bearer_token --auth-value-env VAR]`, `mcp update S --access-groups g`, `mcp delete S --yes` |
 | MCP: who is connected right now? kick a session | `mcp sessions` (per worker process), `mcp sessions-close --user U|--prefix P --yes` |
@@ -89,7 +95,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 `users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
-`mcp delete`, `mcp sessions-close` need `--yes`
+`mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve` need `--yes`
 when there is no TTY.
 
 ## Workflow for any change
@@ -207,6 +213,34 @@ when there is no TTY.
   repeat or target each node with `--url`. Both need an admin key (403
   otherwise). `mcp health` connects to every server; `mcp list` does not
   unless `--health`.
+
+- **Guardrails have two sources and two lists.** `GET /guardrails/list`
+  (plain `guardrails list`, and `drift`) is config.yaml ONLY; DB guardrails
+  added through the UI or `guardrails add` show only in `guardrails list
+  --all` (`/v2/guardrails/list`), `SRC=db`. Config guardrails are read-only
+  through the API: `update`/`delete` refuse them.
+- **Guardrail updates are PATCH, never PUT.** Every read is masked, so a
+  read-modify-PUT would write the masked `api_key` back. PATCH can change the
+  name, `default_on`, other params and the description; `mode` and the
+  integration cannot be changed in place (delete and re-add). `default_on`
+  lives inside `litellm_params` — the proxy's own docstring shows it
+  top-level, where it is silently ignored. Renaming a guardrail breaks keys
+  and requests that reference the old name.
+- **Guardrail secrets.** The proxy's mask keeps four real characters; this CLI
+  masks secret-named values completely and cuts `api_base` to its origin.
+  `--api-key` and secret-named `--param`s only take `os.environ/NAME` (the
+  proxy resolves it when it loads the guardrail), so no key enters the DB or
+  shell history.
+- **`guardrails test` is a real request.** It runs the guardrail on your text
+  through `/guardrails/apply_guardrail` (logged, possibly billed by the
+  guardrail service). A 4xx other than 401/403/404 is the guardrail blocking:
+  verdict `blocked`, exit 3. `guardrails logs` leaves prompt/response snippets
+  out unless `--snippets` — they are user content.
+- **`mcp access` default-deny.** A key with no MCP grant, no team, no
+  organisation and no admin owner gets 403 "The key has no MCP servers
+  granted" from the gateway, so it shows `(none)` (it still reaches
+  `allow_all_keys` servers). Owner roles come from the user list; if that
+  cannot be read, no admin role is assumed.
 
 ## Site policy files
 

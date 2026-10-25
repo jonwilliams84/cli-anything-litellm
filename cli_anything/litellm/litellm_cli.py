@@ -11,6 +11,7 @@ import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 import click
@@ -21,6 +22,7 @@ from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import budgets as budgets_mod
 from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
+from cli_anything.litellm.core import guardrails as guard_mod
 from cli_anything.litellm.core import lint as lint_mod
 from cli_anything.litellm.core import logs as logs_mod
 from cli_anything.litellm.core import mcp as mcp_mod
@@ -420,9 +422,54 @@ def guardrails_grp():
     """Guardrails loaded on the proxy."""
 
 
+GUARD_COLS = [
+    ("name", "NAME"),
+    ("source", "SRC"),
+    ("guardrail", "CLASS"),
+    ("mode", "MODE"),
+    ("default_on", "DEFAULT"),
+    ("guardrail_id", "ID"),
+]
+
+
+def all_guardrails(conn) -> list[dict]:
+    """DB + config guardrails (GET /v2/guardrails/list), each with its definition location."""
+    return guard_mod.as_rows(be.get(conn, "/v2/guardrails/list"), "guardrails")
+
+
+def _resolve_guardrail(conn, ref: str, rows: list[dict] | None = None) -> dict[str, Any]:
+    rows = rows if rows is not None else _call(all_guardrails, conn)
+    try:
+        g = guard_mod.resolve(rows, ref)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if not g:
+        raise click.ClickException(f"no guardrail matches {ref!r} — run `guardrails list --all`")
+    return g
+
+
+def _guard_db_only(g: dict[str, Any], verb: str) -> None:
+    if guard_mod.location(g) != "db":
+        raise click.ClickException(
+            f"guardrail {g.get('guardrail_name')} is defined in config.yaml and is read-only through the API — "
+            f"{verb} it in the config the proxy is deployed from"
+        )
+
+
 @guardrails_grp.command("list")
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="DB guardrails too (GET /v2/guardrails/list), with SRC and id. Default: config.yaml only.",
+)
 @click.pass_context
-def guardrails_list(ctx):
+def guardrails_list(ctx, show_all):
+    """Guardrails on the proxy. Without --all: what config.yaml loaded (what `drift` compares)."""
+    if show_all:
+        rows = [guard_mod.normalize(g) for g in _call(all_guardrails, _conn(ctx))]
+        _emit(ctx, rows, lambda r: _table(r, GUARD_COLS))
+        return
     g = _call(live_guardrails, _conn(ctx))
     rows = [
         {
@@ -446,6 +493,381 @@ def guardrails_list(ctx):
             ],
         ),
     )
+
+
+@guardrails_grp.command("info")
+@click.argument("guardrail_ref")
+@click.pass_context
+def guardrails_info(ctx, guardrail_ref):
+    """One guardrail (id or name): params with secrets masked and URLs cut to their origin."""
+    c = _conn(ctx)
+    g = _resolve_guardrail(c, guardrail_ref)
+    gid = g.get("guardrail_id")
+    full = _call(be.get, c, f"/guardrails/{quote(str(gid), safe='')}/info") if gid else g
+    _emit(ctx, guard_mod.redact(full or g))
+
+
+def _guardrail_write_options(fn):
+    for opt in reversed(
+        [
+            click.option("--api-base", default=None, help="Guardrail service URL (or os.environ/NAME)."),
+            click.option(
+                "--api-key", default=None, help="os.environ/NAME only — the proxy reads the variable."
+            ),
+            click.option("--description", default=None),
+            click.option(
+                "--param",
+                "params",
+                multiple=True,
+                metavar="KEY=VALUE",
+                help="Extra litellm_params (repeatable); true/false/numbers are typed.",
+            ),
+        ]
+    ):
+        fn = opt(fn)
+    return fn
+
+
+@guardrails_grp.command("add")
+@click.option("--name", required=True, help="guardrail_name: what keys, teams and requests reference.")
+@click.option("--guardrail", "integration", required=True, help="Integration, e.g. presidio, lakera_v2.")
+@click.option(
+    "--mode", required=True, help=f"One or more of: {', '.join(guard_mod.MODES)} (comma-separated)."
+)
+@click.option("--default-on", is_flag=True, help="Run on every request, not only when asked for.")
+@_guardrail_write_options
+@click.pass_context
+def guardrails_add(ctx, name, integration, mode, default_on, api_base, api_key, description, params):
+    """Add a guardrail to the proxy's database (POST /guardrails); it is live at once.
+
+    A DB guardrail survives a config redeploy and is not in git. `--default-on`
+    puts it on EVERY request — check it with `guardrails test` first.
+    """
+    try:
+        body = guard_mod.new_guardrail(
+            name,
+            integration,
+            mode,
+            default_on=default_on,
+            api_base=api_base,
+            api_key=api_key,
+            description=description,
+            params=guard_mod.parse_params(params),
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/guardrails", body):
+        return
+    res = _call(be.post, _conn(ctx), "/guardrails", body) or {}
+    out = guard_mod.redact(res) if isinstance(res, dict) else res
+    _emit(ctx, out, lambda r: click.echo(f"  added guardrail {name} ({r.get('guardrail_id')})"))
+
+
+@guardrails_grp.command("update")
+@click.argument("guardrail_ref")
+@click.option("--name", default=None, help="Rename (keys/teams referencing the old name stop matching).")
+@click.option(
+    "--default-on/--no-default-on", default=None, help="Run on every request, or only when asked for."
+)
+@_guardrail_write_options
+@click.pass_context
+def guardrails_update(ctx, guardrail_ref, name, default_on, api_base, api_key, description, params):
+    """Change a DB guardrail in place (PATCH /guardrails/{id}): only the flags given are sent.
+
+    `mode` and the integration cannot be changed in place; delete and re-add.
+    """
+    c = _conn(ctx)
+    g = _resolve_guardrail(c, guardrail_ref)
+    _guard_db_only(g, "change")
+    try:
+        body = guard_mod.patch_body(
+            g,
+            name=name,
+            default_on=default_on,
+            api_base=api_base,
+            api_key=api_key,
+            description=description,
+            params=guard_mod.parse_params(params),
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    path = f"/guardrails/{quote(str(g['guardrail_id']), safe='')}"
+    if _dry(ctx, "PATCH", path, body):
+        return
+    res = _call(be.patch, c, path, body) or {}
+    _emit(ctx, guard_mod.redact(res) if isinstance(res, dict) else res)
+
+
+@guardrails_grp.command("delete")
+@click.argument("guardrail_ref")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def guardrails_delete(ctx, guardrail_ref, yes):
+    """Remove a DB guardrail (DELETE /guardrails/{id}); requests stop being checked by it at once.
+
+    Keys, teams and requests that still name it are listed (by key alias) so
+    the dangling references can be cleaned up.
+    """
+    c = _conn(ctx)
+    g = _resolve_guardrail(c, guardrail_ref)
+    _guard_db_only(g, "remove")
+    path = f"/guardrails/{quote(str(g['guardrail_id']), safe='')}"
+    if _dry(ctx, "DELETE", path):
+        return
+    gname = g.get("guardrail_name")
+    referencing = [
+        k.get("key_alias") or k.get("token")
+        for k in _call(all_keys, c)
+        if gname in (k.get("guardrails") or (k.get("metadata") or {}).get("guardrails") or [])
+    ]
+    _confirm(ctx, yes, f"delete guardrail {gname} (named by {len(referencing)} key(s))")
+    _call(be.delete, c, path)
+    _emit(
+        ctx,
+        {"deleted": g["guardrail_id"], "name": gname, "keys_still_naming_it": referencing},
+        lambda d: (
+            click.echo(f"deleted guardrail {d['name']} ({d['deleted']})"),
+            click.echo("keys still naming it: " + (", ".join(d["keys_still_naming_it"]) or "(none)")),
+        ),
+    )
+
+
+@guardrails_grp.command("test")
+@click.argument("guardrail_name")
+@click.option("--text", default=None, help="Text to check (else read from stdin).")
+@click.pass_context
+def guardrails_test(ctx, guardrail_name, text):
+    """Run ONE guardrail on a text (POST /guardrails/apply_guardrail) and report the verdict.
+
+    `passed` = text unchanged, `modified` = rewritten (e.g. PII masked),
+    `blocked` = the guardrail rejected it (exit 3). The call is a real request:
+    it is logged, may hit a paid guardrail service, and runs as the CLI's key.
+    """
+    if text is None:
+        if sys.stdin.isatty():
+            raise click.ClickException("give --text or pipe the text on stdin")
+        text = sys.stdin.read()
+    if not text:
+        raise click.ClickException("nothing to test: the text is empty")
+    body = {"guardrail_name": guardrail_name, "text": text}
+    try:
+        res = be.post(_conn(ctx), "/guardrails/apply_guardrail", body)
+        out = {"guardrail": guardrail_name, **guard_mod.verdict(text, res)}
+    except be.ApiError as e:
+        if e.status == 404:
+            raise click.ClickException(
+                f"{e}  (no guardrail by that name is loaded — `guardrails list --all`)"
+            ) from e
+        if e.status in (401, 403) or e.status is None or e.status >= 500:
+            raise click.ClickException(str(e)) from e
+        out = {"guardrail": guardrail_name, "verdict": "blocked", "status": e.status, "reason": e.message}
+    _emit(
+        ctx,
+        out,
+        lambda d: click.echo(
+            f"  {d['guardrail']}: {d['verdict']}"
+            + (f" — {d.get('reason')}" if d.get("reason") else "")
+            + (f"\n  -> {d['response_text']}" if d["verdict"] == "modified" else "")
+        ),
+    )
+    if out["verdict"] == "blocked":
+        ctx.exit(3)
+
+
+def _usage_window(days, start, end) -> dict[str, str]:
+    try:
+        return guard_mod.window(days, start, end)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+
+@guardrails_grp.command("usage")
+@click.argument("guardrail_ref", required=False)
+@click.option("--days", default=7, type=int, help="Window ending today (the proxy's own default is 7).")
+@click.option("--start", default=None, help="YYYY-MM-DD; with --end, overrides --days.")
+@click.option("--end", default=None, help="YYYY-MM-DD.")
+@click.pass_context
+def guardrails_usage(ctx, guardrail_ref, days, start, end):
+    """How often each guardrail ran, blocked and failed (GET /guardrails/usage/overview).
+
+    With a guardrail: its daily series and per-team / per-key units
+    (/guardrails/usage/detail/{id}). From the proxy's daily metrics tables —
+    no spend-log download. Exit 2 if any guardrail is `critical` (>15% blocked).
+    """
+    c = _conn(ctx)
+    win = _usage_window(days, start, end)
+    if guardrail_ref:
+        g = _resolve_guardrail(c, guardrail_ref)
+        res = (
+            _call(be.get, c, f"/guardrails/usage/detail/{quote(str(g['guardrail_id']), safe='')}", params=win)
+            or {}
+        )
+        keep = (
+            "guardrail_id",
+            "guardrail_name",
+            "provider",
+            "requestsEvaluated",
+            "failRate",
+            "status",
+            "trend",
+        )
+        data = {
+            "window": win,
+            **{k: res.get(k) for k in keep},
+            "time_series": res.get("time_series") or [],
+            "usage_units_by_team": res.get("usage_units_by_team") or {},
+            "cost": res.get("cost"),
+        }
+        _emit(
+            ctx,
+            data,
+            lambda d: (
+                click.echo(
+                    f"  {d['guardrail_name']}: {d['requestsEvaluated']} evaluated, {d['failRate']}% blocked "
+                    f"({d['status']}, trend {d['trend']}) {d['window']['start_date']}..{d['window']['end_date']}"
+                ),
+                _table(d["time_series"], [("date", "DATE"), ("passed", "PASSED"), ("blocked", "BLOCKED")]),
+            ),
+        )
+        if data["status"] == "critical":
+            ctx.exit(2)
+        return
+    res = _call(be.get, c, "/guardrails/usage/overview", params=win) or {}
+    rows = guard_mod.usage_rows(res)
+    critical = [r["name"] for r in rows if r["status"] == "critical"]
+    data = {"window": win, **guard_mod.usage_totals(res), "critical": critical, "rows": rows}
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo(
+                f"  {d['requests']} evaluated, {d['blocked']} blocked, pass rate {d['pass_rate']}% "
+                f"({d['window']['start_date']}..{d['window']['end_date']})"
+            ),
+            _table(
+                d["rows"],
+                [
+                    ("name", "GUARDRAIL"),
+                    ("provider", "PROVIDER"),
+                    ("requests", "EVALUATED"),
+                    ("fail_rate", "BLOCKED%"),
+                    ("status", "STATUS"),
+                    ("trend", "TREND"),
+                ],
+            ),
+        ),
+    )
+    if critical:
+        ctx.exit(2)
+
+
+@guardrails_grp.command("logs")
+@click.argument("guardrail_ref")
+@click.option("--action", type=click.Choice(guard_mod.ACTIONS), default=None)
+@click.option("--days", default=7, type=int)
+@click.option("--start", default=None, help="YYYY-MM-DD; with --end, overrides --days.")
+@click.option("--end", default=None)
+@click.option("--limit", default=50, type=int, help=f"Rows (one page, at most {guard_mod.LOGS_PAGE_MAX}).")
+@click.option("--page", default=1, type=int)
+@click.option("--snippets", is_flag=True, help="Include prompt/response snippets (user content).")
+@click.pass_context
+def guardrails_logs(ctx, guardrail_ref, action, days, start, end, limit, page, snippets):
+    """The requests one guardrail judged (GET /guardrails/usage/logs), newest first.
+
+    Paged server-side through the guardrail index (never a raw spend-log
+    download). Prompt/response snippets are left out unless --snippets.
+    """
+    if not 1 <= limit <= guard_mod.LOGS_PAGE_MAX:
+        raise click.ClickException(f"--limit must be 1..{guard_mod.LOGS_PAGE_MAX}")
+    if page < 1:
+        raise click.ClickException("--page must be at least 1")
+    c = _conn(ctx)
+    win = _usage_window(days, start, end)
+    g = _resolve_guardrail(c, guardrail_ref)
+    params = {"guardrail_id": g["guardrail_id"], "page": page, "page_size": limit, **win}
+    if action:
+        params["action"] = action
+    res = _call(be.get, c, "/guardrails/usage/logs", params=params) or {}
+    rows = guard_mod.log_rows(res, snippets)
+    data = {
+        "guardrail": g.get("guardrail_name"),
+        "total": res.get("total"),
+        "page": res.get("page"),
+        "rows": rows,
+    }
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo(f"  {d['guardrail']}: {d['total']} run(s) in the window, page {d['page']}"),
+            _table(
+                d["rows"],
+                [
+                    ("timestamp", "WHEN"),
+                    ("action", "ACTION"),
+                    ("model", "MODEL"),
+                    ("latency_ms", "LATENCY(ms)"),
+                    ("reason", "REASON"),
+                ],
+            ),
+        ),
+    )
+
+
+@guardrails_grp.command("submissions")
+@click.option("--status", type=click.Choice(["pending_review", "active", "rejected"]), default=None)
+@click.option("--team", default=None, help="Only this team_id.")
+@click.pass_context
+def guardrails_submissions(ctx, status, team):
+    """Team-registered guardrails awaiting review (GET /guardrails/submissions)."""
+    params = {k: v for k, v in {"status": status, "team_id": team}.items() if v}
+    res = _call(be.get, _conn(ctx), "/guardrails/submissions", params=params or None) or {}
+    data = {"summary": res.get("summary") or {}, "submissions": guard_mod.submission_rows(res)}
+    _emit(
+        ctx,
+        data,
+        lambda d: (
+            click.echo("  " + ", ".join(f"{k} {v}" for k, v in d["summary"].items())),
+            _table(
+                d["submissions"],
+                [
+                    ("name", "GUARDRAIL"),
+                    ("status", "STATUS"),
+                    ("team_id", "TEAM"),
+                    ("api_base", "SERVICE"),
+                    ("submitted_by", "BY"),
+                    ("guardrail_id", "ID"),
+                ],
+            ),
+        ),
+    )
+
+
+_SUBMISSION_HELP = {
+    "approve": "Approve a pending team submission: it becomes active and runs at once (--yes off a TTY).",
+    "reject": "Reject a pending team submission.",
+}
+
+
+def _submission_action(verb: str):
+    @guardrails_grp.command(verb, help=_SUBMISSION_HELP[verb])
+    @click.argument("guardrail_id")
+    @click.option("--yes", is_flag=True)
+    @click.pass_context
+    def _cmd(ctx, guardrail_id, yes):
+        path = f"/guardrails/submissions/{quote(guardrail_id, safe='')}/{verb}"
+        if _dry(ctx, "POST", path):
+            return
+        if verb == "approve":
+            # Approval loads a team-supplied guardrail into the live proxy.
+            _confirm(ctx, yes, f"approve guardrail submission {guardrail_id} (it goes live at once)")
+        _emit(ctx, _call(be.post, _conn(ctx), path, None))
+
+    return _cmd
+
+
+_submission_action("approve")
+_submission_action("reject")
 
 
 # ── keys ────────────────────────────────────────────────────────────────────
@@ -1323,11 +1745,24 @@ USER_COLS = [
 USERS_PAGE = 100
 
 
+def _users_page(conn, page: int) -> dict:
+    """One page of users. v1.106.3 has only GET /user/list (``get_users`` in
+    internal_user_endpoints.py: ``page``/``page_size`` ≤ 100, response
+    ``UserListResponse``); /user/get_users is what older proxies served and
+    404s there, so it is tried first only for those and abandoned on 404/405."""
+    try:
+        return be.get(conn, "/user/get_users", params={"page": page, "size": USERS_PAGE}) or {}
+    except be.ApiError as e:
+        if e.status not in (404, 405):
+            raise
+    return be.get(conn, "/user/list", params={"page": page, "page_size": USERS_PAGE}) or {}
+
+
 def all_users(conn, team: str | None = None, role: str | None = None) -> list[dict]:
-    """Every user, following /user/get_users pagination (same loop as keys)."""
+    """Every user, following pagination (same loop as keys)."""
     out, page = [], 1
     while True:
-        res = be.get(conn, "/user/get_users", params={"page": page, "size": USERS_PAGE}) or {}
+        res = _users_page(conn, page)
         rows = res.get("users") or []
         if team or role:
             rows = [
@@ -2020,17 +2455,35 @@ def mcp_access(ctx, server_ref, team):
     """Which keys reach which MCP servers, from each key's own object_permission.
 
     `reaches` is groups ∪ named servers ∪ allow_all_keys servers. A key with
-    no MCP grant of its own shows `reaches: null`: it inherits from its team
-    (or, as an admin key, reaches everything) — not resolved here.
+    no MCP grant of its own is `(inherited: …)` only when a team, an
+    organisation or its owner's admin role could grant servers (`inherits_from`
+    names them; not resolved here). With none of those the gateway denies it
+    outright, and it shows `(none)` (`reaches: []`).
     """
     c = _conn(ctx)
     servers = _call(all_mcp_servers, c)
     want = mcp_mod.server_label(_resolve_mcp(c, server_ref, servers)) if server_ref else None
     names = {s.get("server_id"): mcp_mod.server_label(s) for s in servers}
+    open_to_all = sorted(mcp_mod.server_label(s) for s in servers if s.get("allow_all_keys"))
+    keys = _call(all_keys, c, team)
+    roles: dict[str, str | None] = {}
+    if any(
+        k.get("user_id") and not mcp_mod.key_mcp(k)["access_groups"] and not mcp_mod.key_mcp(k)["servers"]
+        for k in keys
+    ):
+        try:
+            roles = {u.get("user_id"): u.get("user_role") for u in all_users(c)}
+        except be.ApiError:
+            roles = {}  # unreadable roles: an owner's admin role cannot be confirmed
     rows = []
-    for k in _call(all_keys, c, team):
+    for k in keys:
         g = mcp_mod.key_mcp(k)
         reaches = mcp_mod.effective_servers(g, servers)
+        sources: list[str] = []
+        if reaches is None:
+            sources = mcp_mod.inherit_sources(k, roles)
+            if not sources:
+                reaches = open_to_all  # default-deny: only servers open to every key
         if want and (reaches is None or want not in reaches):
             continue
         rows.append(
@@ -2040,6 +2493,7 @@ def mcp_access(ctx, server_ref, team):
                 "access_groups": g["access_groups"],
                 "servers": [names.get(s, s) for s in g["servers"]],
                 "reaches": reaches,
+                "inherits_from": sources,
             }
         )
     _emit(
@@ -2049,7 +2503,7 @@ def mcp_access(ctx, server_ref, team):
             [
                 {
                     **_list_str(r, "access_groups", "servers"),
-                    "reaches": "(inherited)" if r["reaches"] is None else ",".join(r["reaches"]) or "(none)",
+                    "reaches": mcp_mod.reach_label(r["reaches"], r["inherits_from"]),
                 }
                 for r in d["keys"]
             ],

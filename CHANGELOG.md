@@ -1,5 +1,81 @@
 # Changelog
 
+## [0.11.0] — 2026-10-25
+
+Guardrails: from "which ones are loaded" to managing, testing and measuring them.
+
+The CLI could only list config.yaml guardrails (`GET /guardrails/list`, which
+is also what `drift` compares). Guardrails added through the Admin UI live in
+the database and were invisible. Nothing could test a guardrail or show how
+often it blocks, and adding, retuning or retiring one, or reviewing a team's
+submission, meant the UI. Now (shapes from v1.106.3,
+`litellm/proxy/guardrails/guardrail_endpoints.py` and `usage_endpoints.py`):
+
+- **`guardrails list --all`** — config and DB guardrails (`/v2/guardrails/list`)
+  with `SRC=config|db`, integration, mode, `default_on` and id. Plain
+  `guardrails list` is unchanged.
+- **`guardrails info <id|name>`** — one guardrail, redacted.
+- **`guardrails test <name> [--text T | stdin]`** — runs one guardrail on a
+  text (`POST /guardrails/apply_guardrail`): `passed`, `modified` (prints the
+  rewrite, e.g. masked PII) or `blocked` (exit 3). 401/403/404 and 5xx stay
+  errors, never "blocked".
+- **`guardrails usage [<name>] [--days N | --start --end]`** — evaluated /
+  blocked / fail rate / trend per guardrail from the proxy's daily metrics
+  tables (no spend-log download); with a name, its daily series. Exit 2 when
+  any guardrail is `critical` (>15% blocked, the proxy's own threshold).
+  Windows over 366 days are refused before the proxy is called.
+- **`guardrails logs <name> [--action …] [--limit ≤100] [--page]`** — the
+  requests one guardrail judged, paged server-side through the guardrail
+  index. Prompt and response snippets only with `--snippets`.
+- **`guardrails add` / `update` / `delete`** — `POST /guardrails`,
+  `PATCH /guardrails/{id}`, `DELETE /guardrails/{id}`. Update sends only the
+  flags given and never PUTs, because every read is masked and a
+  read-modify-PUT would write the masked `api_key` back. `default_on` goes
+  inside `litellm_params`, the only place `PatchGuardrailRequest` reads it.
+  `mode` and the integration are refused for update (PATCH ignores them).
+  Config guardrails are refused. `delete` is `--yes`-gated and names the keys
+  whose metadata still lists the guardrail.
+- **`guardrails submissions` / `approve` / `reject`** — the team registration
+  queue. `approve` loads a team-supplied guardrail into the live proxy, so
+  it is `--yes`-gated.
+
+### Security
+- Guardrail params are redacted harder than the proxy does. Its
+  `get_masked_values` keeps four real characters of a key; the CLI masks
+  secret-named values completely and cuts `api_base` (which can carry a
+  token in its query) to its origin. `--api-key` and secret-named `--param`
+  values must be `os.environ/NAME`, so a literal key never reaches the DB,
+  argv history or the output. `create_guardrail` echoes the unmasked request
+  back, and that echo is redacted too.
+
+### Fixed
+- `mcp access` showed `(inherited)` for every key without an MCP grant of its
+  own (reviewer follow-up from 0.10.0). A key with no team, no organisation
+  and no admin owner is default-deny on the gateway: `initialize` answers
+  403 "The key has no MCP servers granted"
+  (`_raise_if_initialize_grants_no_mcp_servers`,
+  `proxy/_experimental/mcp_server/operations.py`). Such keys now show
+  `(none)` (`reaches: []`, or just the `allow_all_keys` servers). The
+  `(inherited: team:…, org:…, role:…)` label, and the new `inherits_from`
+  field in `--json`, appear only where `get_mcp_server_access` /
+  `admin_view_unscoped` (`…/mcp_server/auth/user_api_key_auth_mcp.py`) could
+  actually grant servers. Owner roles come from the user list. If that list
+  can't be read, no admin role is assumed.
+- `users list` (and everything that resolves users: `users info/update/delete`,
+  `teams member-add`, and now `mcp access`) called `/user/get_users`, which
+  v1.106.3 does not serve (404 on the live proxy). It now falls back to
+  `GET /user/list` (`get_users` in `internal_user_endpoints.py`, `page_size`
+  ≤ 100).
+
+Core: `core/guardrails.py`; `core/backend.py` gains `patch`;
+`core/mcp.py` gains `inherit_sources` / `reach_label`. Tests:
+`tests/test_guardrails.py` (42: core units, CLI over the mocked proxy, two
+workflows) with fixtures in `tests/guardrail_fixtures.py`, each citing the
+v1.106.3 function it reproduces; `tests/test_mcp.py` +6 (the default-deny
+pin, allow_all_keys, admin/org inheritance, unreadable users, the label
+helpers, the `/user/list` fallback). Docs: README, `TEST.md`, `CLAUDE.md` and
+the SKILL (both copies). (v0.11.0: 310 tests, 92% coverage.)
+
 ## [0.10.0] — 2026-10-25
 
 The MCP gateway: the proxy's other half, from the shell.
