@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.14.0] — 2026-10-31
+
+The tag table: from a free label on a key to a charged, capped chargeback unit.
+
+Tags started as free labels the CLI put on keys (`keys generate --tags`) and
+billed with `spend --by tag` — but the proxy keeps a *table* of tags too
+(LiteLLM's Tag Management, `/tag/*`), and that half was invisible here: a tag
+could not be given a budget, a description, its allowed models or its key list
+from the shell. The tag's budget is also the one cap that survives the feature
+riding several keys — the proxy applies it to every request that carries the
+tag — which `keys generate --budget-id` could only give to one key at a time.
+Now:
+
+- **`tags list`** (`GET /tag/list`): the tag table — name, description, keys,
+  models, `budget_id`. The endpoint returns its rows in more than one envelope
+  (a bare list, `{"tags": [...]}`, `{"data": [...]}`) and its items as table
+  rows or plain tag-name strings for config-declared names; every reader
+  tolerates both, as the other list commands do.
+- **`tags update <tag>`** (`POST /tag/update`): sets the row —
+  `--description`, `--models`, `--keys`, `--budget-id`. The endpoint replaces
+  the whole row and is an **upsert** (there is no `/tag/create`), so the CLI
+  merges the current row's fields in and each flag overrides, exactly the way
+  `keys update` handles `/key/update`; updating a name not in the table
+  creates its row, and the human output says so. Run with `--dry-run` first;
+  dry-run prints the merged body, which is where "replaces the whole row" can
+  be checked against reality before it runs.
+- **`tags delete <tag>`** (`POST /tag/delete`, body `{"tags": [...]}` — the
+  plural is the family's own inconsistency; update is single): strips the tag
+  from every key and team riding it and deletes the row, deleting no key.
+  Refused when no live tag matches (`tags list` first), and `--yes`-gated off
+  a TTY, dry-runnable.
+
+### Chargeback, closed loop
+
+`keys generate --tags feat-x` → `tags update feat-x --budget-id eng-2026` (one
+cap, enforced by the proxy, for every request carrying `feat-x` across all the
+keys riding it) → `spend --by tag` (the bill) → `logs list --tag feat-x` (the
+drill-down). Each step is its own command; this release adds the one step that
+was only in the Admin UI.
+
+The mutating bodies were not run live; their shapes come from the proxy's tag
+management routes, and the fixtures cite what each call is modelled on. As
+ever with a proxy whose shape differs, capture the shape into a test before
+changing code.
+
 ## [0.13.0] — 2026-10-25
 
 The response cache: from one word of health to running it.

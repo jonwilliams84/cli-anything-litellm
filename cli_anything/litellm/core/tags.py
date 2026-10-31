@@ -8,6 +8,18 @@ LiteLLM's chargeback dimension *between* keys and models: one key can serve
 several features and be billed across them, and "how much does feature X cost"
 is answerable without minting a key per feature.
 
+The proxy has a tag *table* too (``/tag/*`` — Tag Management): a named tag
+object that carries a description, the keys riding it, the models it is
+allowed on and a ``budget_id`` — a budget the proxy applies to every request
+carrying the tag, across all keys that share it. That is how one feature's cap
+is set once when the feature rides several keys. The endpoints are
+``GET /tag/list``, ``POST /tag/update`` (which is an upsert — there is no
+``/tag/create``; updating a name not in the list creates its row) and
+``POST /tag/delete`` (body ``{"tags": [...]}``). ``GET /tag/list`` returns
+envelopes in more than one shape — a bare list, ``{"tags": [...]}``,
+``{"data": [...]}``. Its items are the table rows as dicts, or plain tag-name
+strings for config-declared names, so every reader tolerates both.
+
 Shape notes (tolerated variants, as proxies store this in more than one way):
 
 - The spend log's ``request_tags`` column is a *text* column: a JSON-encoded
@@ -138,3 +150,115 @@ def spend_by_tag(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for a in out:
         a["spend"] = round(a["spend"], 4)
     return out
+
+
+# ── tag management (/tag/*) ────────────────────────────────────────────────
+
+
+def as_rows(res: Any) -> list[dict[str, Any]]:
+    """Whatever ``/tag/list`` returned, as a list of tag rows.
+
+    Proxies return a bare list, ``{"tags": [...]}`` or ``{"data": [...]}``;
+    items are the table rows as dicts or plain tag-name strings
+    (config-declared names). Strings become rows with only ``tag`` set.
+    """
+    items: Any = res
+    if isinstance(res, dict):
+        for key in ("tags", "data"):
+            if isinstance(res.get(key), list):
+                items = res[key]
+                break
+    if not isinstance(items, list):
+        return []
+    return [i if isinstance(i, dict) else {"tag": str(i)} for i in items]
+
+
+def row_tag(row: dict[str, Any]) -> str | None:
+    """The tag's name, on any shape the list returns (``tag``, ``tag_id``, ``name``)."""
+    for key in ("tag", "tag_id", "name"):
+        v = row.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def normalize(row: dict[str, Any]) -> dict[str, Any]:
+    """One row per tag, as both the table and --json output show it.
+
+    A config-declared tag is just a name; unknown fields are not invented.
+    """
+    tag = row_tag(row)
+    return {
+        "tag": tag,
+        "description": row.get("description"),
+        "models": row.get("models"),
+        "keys": row.get("keys"),
+        "budget_id": row.get("budget_id") or (row.get("litellm_budget_table") or {}).get("budget_id"),
+    }
+
+
+def resolve_tag(rows: list[dict[str, Any]], ref: str) -> dict[str, Any] | None:
+    """Match ``ref`` against live tags, by exact name (tags have no alias).
+
+    Returns ``{by, matches, tag}`` or None — the shape every resolver in this
+    CLI returns, so the calling command can refuse an unknown reference it
+    would otherwise let the proxy 400.
+    """
+    if not ref:
+        return None
+    hits = [r for r in rows if row_tag(r) == ref]
+    if hits:
+        return {"by": "tag", "matches": [ref], "row": hits[0]}
+    return None
+
+
+def _fields(spec: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in spec.items() if v is not None and v != [] and v != ""}
+
+
+def update_body(
+    current: dict[str, Any] | None,
+    tag: str,
+    description: str | None = None,
+    models: list[str] | None = None,
+    keys: list[str] | None = None,
+    budget_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the POST /tag/update body: the current row's fields plus the changes.
+
+    ``/tag/update`` replaces the whole row (it is an upsert), so like
+    ``keys update`` sending *only* the change would clear every field the row
+    already carries — the current row (from ``/tag/list``) is merged in and
+    each flag overrides. A name that is not in the list yet (``current`` None)
+    creates the row: there is no ``/tag/create``, the update doubles as it.
+    Raises ValueError when there is nothing to set — a body with just ``tag``
+    is a no-op round trip.
+    """
+    if not tag or not tag.strip():
+        raise ValueError("identify the tag with TAG — run `tags list`")
+    changes = _fields({"description": description, "models": models, "keys": keys, "budget_id": budget_id})
+    if not changes:
+        raise ValueError("nothing to update: --description, --models, --keys or --budget-id")
+    kept = (current or {}).get("litellm_budget_table") or {}
+    base = _fields(
+        {
+            "description": (current or {}).get("description"),
+            "models": (current or {}).get("models"),
+            "keys": list((current or {}).get("keys") or []) if current else None,
+            "budget_id": (current or {}).get("budget_id") or kept.get("budget_id"),
+        }
+    )
+    base.pop("tag", None)
+    return {"tag": tag, **base, **changes}
+
+
+def delete_body(tags: list[str]) -> dict[str, Any]:
+    """The POST /tag/delete body — the one endpoint in the family that is plural.
+
+    The proxy removes the tag from the table and from every key and team
+    riding it; it deletes no key.
+    """
+    tags = [t for t in tags if t and t.strip()]
+    if not tags:
+        raise ValueError("identify the tag with TAG — run `tags list`")
+    return {"tags": tags}
