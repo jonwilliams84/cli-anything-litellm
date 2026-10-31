@@ -12,7 +12,10 @@ description: >-
   app behind the proxy: track and cap by user_id, block, delete), per-request
   logs from the spend log (who called what, at what spend/latency, filterable
   by key/user/team/model/tag), spend (grouped by model/key/team/user/tag) and
-  tags on keys for per-feature chargeback; usage report — server-side spend
+  tags on keys for per-feature chargeback — including the proxy's tag table
+  (/tag/list, /tag/update upsert, /tag/delete: a tag object with description,
+  keys, models and a budget_id the proxy applies to every request carrying the
+  tag); usage report — server-side spend
   reports the proxy aggregates in its own
   database (/global/spend/report: per
   day/team/key/model/customer over any window, even one a raw-log download
@@ -108,12 +111,15 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Change the cache (ttl, host, credentials)? | `cache settings test --set k=v …` (connects, never saves), then `cache settings update --set k=v …` — changes merge over the effective settings; secrets must be `os.environ/NAME`; warns when a target change drops the stored credential |
 | A client keeps getting a stale answer | `cache delete <key> --yes` — the key is the response's `x-litellm-cache-key` header; the next request re-hits the backend. `cache flushall --yes` drops everything |
 | What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
+| What tags have their own rules? | `tags list` — the proxy's tag table (`/tag/list`): description, keys, models, budget_id; a config-declared tag that no table row backs appears as a bare name |
+| Cap one feature across all the keys that carry it | `tags update <tag> --budget-id B [--description D] [--models m1,m2] [--keys k1,k2]` — POST /tag/update, an UPSERT (there is no /tag/create: a name not in the table gets its row created); it replaces the whole row, so the current values are merged in and each flag overrides, like `keys update` |
+| Retire a tag from the table | `tags delete <tag> --yes` — POST /tag/delete `{"tags": [...]}`: strips the tag from the keys and teams riding it and deletes the row; it deletes no key. Refused when no live tag matches |
 
 Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 `users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
 `mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve`,
-`models block`, `fallbacks delete`, `cache delete`, `cache flushall`
+`models block`, `fallbacks delete`, `cache delete`, `cache flushall`, `tags delete`
 need `--yes` when there is no TTY (`cache settings update` needs it only to
 pin a row over a config-owned cache — see traps).
 
@@ -201,7 +207,14 @@ pin a row over a config-owned cache — see traps).
   serve several features; requests with no tags land in `(untagged)`.
   `keys update --tags` replaces the tag set and keeps the rest of the key's
   metadata (`/key/update` otherwise replaces the whole object), and `keys
-  rotate` carries the tags over to the replacement key.
+  rotate` carries the tags over to the replacement key. The tag *table*
+  (`/tag/*`) is separate: `tags update` on a name not in the list CREATES the
+  row (there is no `/tag/create` — the update is an upsert), and it replaces
+  the whole row the same way `/key/update` does, so the CLI merges the current
+  fields in and each flag overrides. A tag's `budget_id` caps every request
+  that carries the tag, across all keys riding it — one cap for one feature
+  that rides several keys. `tags delete` un-tags the keys and teams, deleting
+  neither.
 
 - **MCP servers have two sources, like models.** `mcp_servers:` in config.yaml
   shows as `SRC=config` (`is_config: true`): the API cannot change or delete it,

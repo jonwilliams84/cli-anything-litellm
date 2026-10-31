@@ -2319,6 +2319,99 @@ def budgets_delete(ctx, budget_id, yes):
     _emit(ctx, {"deleted": budget_id}, None)
 
 
+# ── tags (the proxy's tag table) ───────────────────────────────────────────
+
+
+TAG_COLS = [
+    ("tag", "TAG"),
+    ("description", "DESCRIPTION"),
+    ("budget_id", "BUDGET_ID"),
+    ("models", "MODELS"),
+    ("keys", "KEYS"),
+]
+
+
+def all_tags(conn) -> list[dict]:
+    """The live tag table (the /tag/list rows, whatever envelope they come in)."""
+    return tags_mod.as_rows(be.get(conn, "/tag/list") or {})
+
+
+@cli.group("tags")
+def tags_grp():
+    """The proxy's tag table: budgets, models and descriptions per tag.
+
+    Keys carry tags (`keys generate --tags`), `spend --by tag` bills per tag —
+    and a tag here can carry its own budget, so one feature's cap is set once
+    even when the feature rides several keys.
+    """
+
+
+@tags_grp.command("list")
+@click.pass_context
+def tags_list(ctx):
+    """GET /tag/list — tag table rows; config-declared tags appear as bare names."""
+    rows = [tags_mod.normalize(r) for r in _call(all_tags, _conn(ctx))]
+    _emit(ctx, rows, lambda r: _table(r, TAG_COLS))
+
+
+@tags_grp.command("update")
+@click.argument("tag")
+@click.option("--description", default=None)
+@click.option("--models", default=None, help="Models the tag is allowed on, comma-separated.")
+@click.option("--keys", default=None, help="The keys this tag rides on, comma-separated.")
+@click.option("--budget-id", "budget_id", default=None, help="A budget the proxy applies per tag.")
+@click.pass_context
+def tags_update(ctx, tag, description, models, keys, budget_id):
+    """POST /tag/update — sets the row. Creates it when the tag is not in the table yet.
+
+    The endpoint replaces the whole row, so the current values are merged in
+    and each flag overrides — like `keys update`. A tag with --budget-id caps
+    every request that carries the tag, across all keys riding it.
+    """
+    c = _conn(ctx)
+    rows = tags_mod.as_rows(_call(all_tags, c))
+    hit = tags_mod.resolve_tag(rows, tag)
+    try:
+        body = tags_mod.update_body(
+            hit["row"] if hit else None,
+            tag,
+            description=description,
+            models=tags_mod.parse_tags(models) if models else None,
+            keys=tags_mod.parse_tags(keys) if keys else None,
+            budget_id=budget_id,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/tag/update", body):
+        return
+    res = _call(be.post, c, "/tag/update", body)
+    _emit(
+        ctx,
+        res,
+        lambda r: click.echo(
+            f"  updated tag {tag}" + ("" if hit else " (created — it was not in the table yet)")
+        ),
+    )
+
+
+@tags_grp.command("delete")
+@click.argument("tag")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def tags_delete(ctx, tag, yes):
+    """POST /tag/delete. Keys and teams riding the tag keep working, untagged."""
+    c = _conn(ctx)
+    hit = tags_mod.resolve_tag(_call(all_tags, c), tag)
+    if not hit:
+        raise click.ClickException(f"no live tag matches {tag!r} — run `tags list`")
+    body = tags_mod.delete_body([tag])
+    if _dry(ctx, "POST", "/tag/delete", body):
+        return
+    _confirm(ctx, yes, f"delete tag {tag}")
+    _call(be.post, c, "/tag/delete", body)
+    _emit(ctx, {"deleted": tag}, None)
+
+
 # ── customers ───────────────────────────────────────────────────────────────
 
 

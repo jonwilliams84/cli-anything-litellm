@@ -773,3 +773,72 @@ def test_totals_roll_up_the_window():
     ]
     assert usg.totals(rows) == {"rows": 2, "days": 2, "spend": 1.5, "prompt_tokens": 10, "completion_tokens": 4}
     assert usg.totals([]) == {"rows": 0, "days": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+
+# ── tag management (/tag/*) ───────────────────────────────────────────────
+
+from cli_anything.litellm.core import tags as tg
+
+
+def tag_row(tag="feat-checkout", description="feature work", models=None, keys=None, budget_id=None):
+    return {
+        "tag": tag,
+        "description": description,
+        "models": models or [],
+        "keys": keys or [],
+        "budget_id": budget_id,
+    }
+
+
+def test_tag_as_rows_tolerates_every_envelope_and_string_items():
+    rows = [{"tag": "feat", "description": "d", "keys": ["svc"]}, "config-declared-tag"]
+    assert tg.as_rows(rows) == [{"tag": "feat", "description": "d", "keys": ["svc"]}, {"tag": "config-declared-tag"}]
+    assert tg.as_rows({"tags": rows}) == tg.as_rows(rows)
+    assert tg.as_rows({"data": rows}) == tg.as_rows(rows)
+    assert tg.as_rows({"unrelated": 1}) == []
+    assert tg.as_rows(None) == []
+    assert tg.as_rows({"tags": [42]}) == [{"tag": "42"}]
+
+
+def test_tag_normalize_names_the_row_and_pulls_the_budget():
+    assert tg.normalize(tag_row(budget_id="eng-2026"))["tag"] == "feat-checkout"
+    nested = {"tag_id": "feat", "litellm_budget_table": {"budget_id": "b1"}, "models": None}
+    got = tg.normalize(nested)
+    assert got == {"tag": "feat", "description": None, "models": None, "keys": None, "budget_id": "b1"}
+    assert tg.normalize({"name": "cfg-tag"})["tag"] == "cfg-tag"
+
+
+def test_tag_resolve_by_exact_name_and_unknown_is_none():
+    rows = [tag_row(), tag_row("other")]
+    assert tg.resolve_tag(rows, "feat-checkout")["row"] == rows[0]
+    assert tg.resolve_tag(rows, "ghost") is None
+    assert tg.resolve_tag(rows, "") is None
+
+
+def test_tag_update_body_merges_over_the_current_row():
+    body = tg.update_body(tag_row(models=["qwen"], keys=["svc"]), "feat-checkout", budget_id="b1")
+    assert body == {
+        "tag": "feat-checkout",
+        "description": "feature work",
+        "models": ["qwen"],
+        "keys": ["svc"],
+        "budget_id": "b1",
+    }
+
+
+def test_tag_update_body_new_tag_carries_only_the_flags():
+    body = tg.update_body(None, "new-tag", description="d")
+    assert body == {"tag": "new-tag", "description": "d"}
+
+
+def test_tag_update_body_refuses_noop_and_empty_tag():
+    with pytest.raises(ValueError, match="nothing to update"):
+        tg.update_body(tag_row(), "feat-checkout")
+    with pytest.raises(ValueError, match="TAG"):
+        tg.update_body(None, "  ")
+
+
+def test_tag_delete_body_is_plural_and_requires_a_tag():
+    assert tg.delete_body(["feat", "feat2"]) == {"tags": ["feat", "feat2"]}
+    with pytest.raises(ValueError, match="TAG"):
+        tg.delete_body([" ", ""])

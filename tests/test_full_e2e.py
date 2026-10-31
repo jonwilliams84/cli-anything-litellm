@@ -1229,3 +1229,148 @@ def test_workflow_spend_by_key_and_usage_report_agree_and_logs_drill_down():
     assert r2.exit_code == 0 and round(out["spend"], 2) == 1.75 and "svc" in json.dumps(out["rows"])
     r3 = run(["logs", "list", "--key", "svc", "--days", "7"], get=get)
     assert r3.exit_code == 0 and r3.output.count("qwen") == 2
+
+
+# ── tags (the proxy's tag table) ──────────────────────────────────────────
+
+
+def tag(name="feat-checkout", **kw):
+    return {"tag": name, "description": "feature work", "models": [], "keys": ["svc"], "budget_id": None, **kw}
+
+
+def test_tags_list_tolerates_string_items_and_shows_rows():
+    get = lambda c, p, **k: {"tags": [tag(), "cfg-declared"]} if p == "/tag/list" else {}
+    r = run(["tags", "list"], get=get)
+    assert r.exit_code == 0 and "feat-checkout" in r.output and "cfg-declared" in r.output
+    r2 = run(["--json", "tags", "list"], get=get)
+    rows = json.loads(r2.output)
+    assert rows[0] == {
+        "tag": "feat-checkout",
+        "description": "feature work",
+        "models": [],
+        "keys": ["svc"],
+        "budget_id": None,
+    }
+    assert rows[1]["tag"] == "cfg-declared" and rows[1]["description"] is None
+
+
+def test_tags_update_dry_run_merges_the_current_row_and_sends_nothing():
+    get = lambda c, p, **k: {"tags": [tag(models=["qwen"], keys=["svc"])]} if p == "/tag/list" else {}
+    post = mock.Mock()
+    r = run(
+        ["--dry-run", "tags", "update", "feat-checkout", "--budget-id", "eng-2026"],
+        get=get,
+        post=post,
+    )
+    body = json.loads(r.output)["body"]
+    assert body == {
+        "tag": "feat-checkout",
+        "description": "feature work",
+        "models": ["qwen"],
+        "keys": ["svc"],
+        "budget_id": "eng-2026",
+    }
+    post.assert_not_called()
+
+
+def test_tags_update_new_tag_upserts_only_its_flags():
+    get = lambda c, p, **k: {"tags": [tag()]} if p == "/tag/list" else {}
+    post = mock.Mock(return_value={"updated_tag": {"tag": "feat-2", "budget_id": "b1"}})
+    r = run(["tags", "update", "feat-2", "--budget-id", "b1", "--models", "qwen,embed"], get=get, post=post)
+    post.assert_called_once()
+    assert post.call_args.args[1:] == (
+        "/tag/update",
+        {"tag": "feat-2", "budget_id": "b1", "models": ["qwen", "embed"]},
+    )
+    assert r.exit_code == 0 and "created" in r.output
+
+
+def test_tags_update_nothing_to_set_is_refused_before_the_proxy():
+    post = mock.Mock()
+    r = run(["tags", "update", "feat-checkout"], post=post)
+    assert r.exit_code != 0 and "nothing to update" in r.output
+    post.assert_not_called()
+
+
+def test_tags_update_sets_keys_and_description_from_flags():
+    get = lambda c, p, **k: {"tags": [tag()]} if p == "/tag/list" else {}
+    post = mock.Mock(return_value={})
+    r = run(
+        ["--json", "tags", "update", "feat-checkout", "--keys", "a,b", "--description", "checkout"],
+        get=get,
+        post=post,
+    )
+    post.assert_called_once()
+    assert post.call_args.args[1:] == (
+        "/tag/update",
+        {"tag": "feat-checkout", "description": "checkout", "keys": ["a", "b"]},
+    )
+
+
+def test_tags_delete_refuses_unknown_tag_and_requires_yes():
+    get = lambda c, p, **k: {"tags": [tag()]} if p == "/tag/list" else {}
+    post = mock.Mock()
+    r = run(["tags", "delete", "ghost", "--yes"], get=get, post=post)
+    assert r.exit_code != 0 and "no live tag matches 'ghost'" in r.output
+    post.assert_not_called()
+    r2 = run(["tags", "delete", "feat-checkout"], get=get, post=post)
+    assert r2.exit_code != 0 and "without --yes" in r2.output
+    post.assert_not_called()
+
+
+def test_tags_delete_dry_run_exact_body_then_real():
+    get = lambda c, p, **k: {"tags": [tag()]} if p == "/tag/list" else {}
+    post = mock.Mock(return_value={"deleted_keys": [], "deleted_tags": ["feat-checkout"]})
+    r = run(["--dry-run", "tags", "delete", "feat-checkout"], get=get, post=post)
+    assert json.loads(r.output)["body"] == {"tags": ["feat-checkout"]}
+    post.assert_not_called()
+    r2 = run(["--json", "tags", "delete", "feat-checkout", "--yes"], get=get, post=post)
+    assert post.call_args.args[1:] == ("/tag/delete", {"tags": ["feat-checkout"]})
+    assert json.loads(r2.output) == {"deleted": "feat-checkout"}
+
+
+# ── workflow: a chargeback tag, capped once, billed per tag ───────────────
+
+
+def test_workflow_keys_carry_a_tag_the_tag_table_caps_it_and_bills_it():
+    """keys generate --tags puts the tag on the key; tags update gives the tag
+    its own budget (set once, applied to every key riding it); spend --by tag
+    and tags list then both show the same tag."""
+    state = {"tag_budget": None}
+
+    def get(c, p, **k):
+        if p == "/key/list":
+            return {"keys": [], "total_pages": 1}
+        if p == "/tag/list":
+            return {"tags": [{"tag": "feat-checkout", "budget_id": state["tag_budget"]}]}
+        rows = [
+            {
+                "api_key": "a" * 64,
+                "spend": 1.5,
+                "model_group": "qwen",
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "request_tags": json.dumps(["feat-checkout"]),
+            },
+            {"api_key": "b" * 64, "spend": 0.25, "model_group": "qwen", "prompt_tokens": 1},
+        ]
+        return rows if p.startswith("/spend/logs") else {}
+
+    def post(c, path, body=None, **k):
+        if path == "/tag/update":
+            state["tag_budget"] = body["budget_id"]
+        return {}
+
+    r1 = run(["keys", "generate", "--alias", "svc", "--models", "qwen", "--tags", "feat-checkout"], get=get)
+    assert r1.exit_code == 0
+
+    r2 = run(["tags", "update", "feat-checkout", "--budget-id", "eng-2026"], get=get, post=post)
+    assert r2.exit_code == 0 and state["tag_budget"] == "eng-2026"
+
+    r3 = run(["--json", "spend", "--by", "tag", "--days", "7"], get=get)
+    rows = json.loads(r3.output)["rows"]
+    assert [row["tag"] for row in rows] == ["feat-checkout", "(untagged)"]
+    assert rows[0]["spend"] == 1.5 and rows[0]["requests"] == 1
+
+    r4 = run(["--json", "tags", "list"], get=get)
+    assert [row["budget_id"] for row in json.loads(r4.output)] == ["eng-2026"]
