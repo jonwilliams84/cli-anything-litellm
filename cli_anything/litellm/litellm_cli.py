@@ -21,6 +21,7 @@ from cli_anything.litellm import __version__
 from cli_anything.litellm.core import backend as be
 from cli_anything.litellm.core import cache as cache_mod
 from cli_anything.litellm.core import budgets as budgets_mod
+from cli_anything.litellm.core import callbacks as cb_mod
 from cli_anything.litellm.core import customers as customers_mod
 from cli_anything.litellm.core import drift as drift_mod
 from cli_anything.litellm.core import fallbacks as fb_mod
@@ -2410,6 +2411,176 @@ def tags_delete(ctx, tag, yes):
     _confirm(ctx, yes, f"delete tag {tag}")
     _call(be.post, c, "/tag/delete", body)
     _emit(ctx, {"deleted": tag}, None)
+
+
+# ── callbacks (logging/observability integrations) ─────────────────────────
+
+
+def _config_callbacks(conn) -> dict[str, Any]:
+    """The stored config view (GET /get/config/callbacks): stored + runtime
+    callback rows, alerting destinations, available callbacks."""
+    res = be.get(conn, "/get/config/callbacks") or {}
+    return res if isinstance(res, dict) else {}
+
+
+@cli.group("callbacks")
+def callbacks_grp():
+    """Logging callbacks: which integrations log (or bill) every request.
+
+    Langfuse, OpenTelemetry, S3, Datadog, Langsmith, Lago, a custom HTTP
+    endpoint — each callback receives the success and/or failure event of every
+    request the proxy serves. `callbacks list` shows what is active on the
+    running worker; `callbacks config` shows what is stored, on each callback's
+    own environment variables, plus the alerting destinations (Slack, email,
+    MS Teams). Secrets are redacted here, whatever role the key carries.
+    """
+
+
+@callbacks_grp.command("list")
+@click.pass_context
+def callbacks_list(ctx):
+    """GET /callbacks/list — the callbacks active on this worker, by event type.
+
+    Includes internal loggers nobody configured (spend tracking, alerting):
+    `callbacks config` is the view a delete or an add is measured against.
+    """
+    by_type = cb_mod.as_by_type(_call(be.get, _conn(ctx), "/callbacks/list"))
+    rows = [{"type": t, "callback": c} for t in cb_mod.BY_TYPES for c in by_type[t]]
+    _emit(
+        ctx,
+        rows,
+        lambda r: _table(
+            r,
+            [
+                ("type", "ON"),
+                ("callback", "CALLBACK"),
+            ],
+        ),
+    )
+
+
+@callbacks_grp.command("config")
+@click.option("--alerts", is_flag=True, help="Also show the alerting destinations (slack, email, ms_teams).")
+@click.pass_context
+def callbacks_config(ctx, alerts):
+    """GET /get/config/callbacks — where each callback is configured from.
+
+    One row per callback: stored (DB/config.yaml) or runtime (the DB store the
+    delete endpoint reaches is the only one, so `read_only` rows are not yours
+    to delete), with its environment variables. Credential-named values are
+    masked — the proxy hands real values to an admin key, and this drops them
+    before anything echoes. `available` lists the names the Admin UI can add:
+    that, and each callback's expected variables, is what `callbacks add`
+    works from.
+    """
+    res = _call(_config_callbacks, _conn(ctx))
+    rows = [cb_mod.normalize(r) for r in cb_mod.as_rows(res)]
+    alert_rows = [
+        {
+            "name": a.get("name"),
+            **{k: v for k, v in a.items() if k not in ("name", "variables")},
+            "variables": a.get("variables"),
+        }
+        for a in cb_mod.alerts(res)
+    ]
+    avail = sorted(cb_mod.available(res))
+    payload: dict[str, Any] = {"callbacks": rows, "available": avail}
+    if alerts:
+        payload["alerts"] = alert_rows
+
+    def _vars_str(v):
+        if not isinstance(v, dict) or not v:
+            return ""
+        return ", ".join(f"{k}={v if v is not None else '(unset)'}" for k, v in v.items())
+
+    def human(r):
+        _table(
+            [
+                {
+                    **row,
+                    "src": "runtime" if row["read_only"] else "stored",
+                    "vars": _vars_str(row["variables"]),
+                }
+                for row in rows
+            ],
+            [
+                ("name", "CALLBACK"),
+                ("type", "TYPE"),
+                ("src", "SRC"),
+                ("vars", "VARIABLES"),
+            ],
+        )
+        if alerts and alert_rows:
+            click.echo()
+            _table(
+                [{**a, "vars": _vars_str(a.get("variables"))} for a in alert_rows],
+                [("name", "ALERTING"), ("active_alerts", "ACTIVE_ALERTS"), ("vars", "VARIABLES")],
+            )
+        if avail:
+            click.echo(f"\n  addable: {', '.join(avail)}")
+
+    _emit(ctx, payload, human)
+
+
+@callbacks_grp.command("add")
+@click.argument("name")
+@click.option("--env", "envs", multiple=True, help="Callback variable KEY=value; secrets as os.environ/NAME.")
+@click.pass_context
+def callbacks_add(ctx, name, envs):
+    """POST /config/update — add a success callback (DB-stored, survives restarts).
+
+    The name is any callback the proxy knows (and with a custom callback
+    module, its import path). `--env` sets the variables that callback declares:
+    `callbacks config --json` lists what each addable callback expects. The
+    proxy unions the new name over the stored success list, so other callbacks
+    keep logging. `--dry-run` first: it prints the body with values masked.
+    """
+    c = _conn(ctx)
+    rows = cb_mod.as_rows(_call(_config_callbacks, c))
+    try:
+        body = cb_mod.add_body(name, rows, cb_mod.parse_envs(envs) if envs else None)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/config/update", cb_mod.masked_body(body, envs)):
+        return
+    res = _call(be.post, c, "/config/update", body) or {}
+    _emit(ctx, res, lambda r: click.echo(f"  added callback {name.lower()}: {r.get('message', 'ok')}"))
+
+
+@callbacks_grp.command("delete")
+@click.argument("name")
+@click.option("--yes", is_flag=True)
+@click.pass_context
+def callbacks_delete(ctx, name, yes):
+    """POST /config/callback/delete — remove a stored success callback.
+
+    Only DB-stored success callbacks are reachable: runtime loggers and
+    failure-type callbacks are refused here with the reason (the endpoint's
+    404 does not say why). Keys and requests are unaffected: only logging
+    stops. `--dry-run` first.
+    """
+    c = _conn(ctx)
+    rows = cb_mod.as_rows(_call(_config_callbacks, c))
+    try:
+        body = cb_mod.delete_body(rows, name)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if _dry(ctx, "POST", "/config/callback/delete", body):
+        return
+    _confirm(ctx, yes, f"delete callback {body['callback_name']} (logging stops for it)")
+    res = _call(be.post, c, "/config/callback/delete", body) or {}
+    _emit(
+        ctx,
+        res,
+        lambda r: click.echo(
+            f"  deleted callback {r.get('removed_callback', body['callback_name'])}"
+            + (
+                f"; still logging: {', '.join(r['remaining_callbacks'])}"
+                if r.get("remaining_callbacks")
+                else ""
+            )
+        ),
+    )
 
 
 # ── customers ───────────────────────────────────────────────────────────────

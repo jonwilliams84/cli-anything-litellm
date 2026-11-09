@@ -28,7 +28,13 @@ description: >-
   The response cache — health (ping, plus the Redis under it: memory, hit
   rate, evictions), the stored settings (show, test, update — secrets as
   os.environ/ refs), targeted invalidation by x-litellm-cache-key and
-  flushall. Detects DRIFT between
+  flushall; logging callbacks — what actually logs (or bills) every request:
+  the active list by event type, the stored rows and each callback's
+  environment variables (credential-masked), the Slack/email/Teams alerting
+  destinations, adding a DB-stored success callback (its variables
+  encrypted at rest, secrets as os.environ/ refs), and deleting one (only the
+  DB-stored success callback — runtime and failure-type rows are refused with
+  the reason). Detects DRIFT between
   the config.yaml
   in git and the running proxy (including models added through the Admin UI that
   exist only in its database, and fallback rules set through the API), differences between proxies behind one VIP (the
@@ -110,6 +116,8 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | What are the stored cache settings? | `cache settings` — the DB row + REDIS_* env the proxy reports, credentials as `***REDACTED***`; a cache configured in config.yaml does NOT appear here, and it warns when these settings name a different Redis from the live cache |
 | Change the cache (ttl, host, credentials)? | `cache settings test --set k=v …` (connects, never saves), then `cache settings update --set k=v …` — changes merge over the effective settings; secrets must be `os.environ/NAME`; warns when a target change drops the stored credential |
 | A client keeps getting a stale answer | `cache delete <key> --yes` — the key is the response's `x-litellm-cache-key` header; the next request re-hits the backend. `cache flushall --yes` drops everything |
+| Which logging integrations actually run (Langfuse, OTEL, S3, Datadog, Langsmith, Lago…) and when do they fire? | `callbacks list` (active on the worker, by event type: success / failure / success_and_failure), `callbacks config [--alerts]` (stored rows: their event type, where they come from — `read_only` = runtime, not yours to delete — and each callback's own variables, credential-masked; `--alerts` adds the Slack/email/Teams destinations) |
+| Add (or stop) logging to an integration | `callbacks add <name> --env KEY=os.environ/VAR [--dry-run]` (DB-stored: the proxy unions the name over the stored success list, so other callbacks keep logging; variables are encrypted at rest), `callbacks delete <name> --yes` (only DB-stored success callbacks — runtime or failure-type ones are refused with the reason). `callbacks config --json`'s `available` names every addable callback and the variables each expects |
 | What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
 | What tags have their own rules? | `tags list` — the proxy's tag table (`/tag/list`): description, keys, models, budget_id; a config-declared tag that no table row backs appears as a bare name |
 | Cap one feature across all the keys that carry it | `tags update <tag> --budget-id B [--description D] [--models m1,m2] [--keys k1,k2]` — POST /tag/update, an UPSERT (there is no /tag/create: a name not in the table gets its row created); it replaces the whole row, so the current values are merged in and each flag overrides, like `keys update` |
@@ -119,7 +127,7 @@ Mutations: always run with `--dry-run` first (prints the exact request, sends
 nothing). `keys block`, `keys rotate`, `keys delete`, `models delete`,
 `users delete`, `teams block`, `teams delete`, `budgets delete`, `customers block`, `customers delete`,
 `mcp delete`, `mcp sessions-close`, `guardrails delete`, `guardrails approve`,
-`models block`, `fallbacks delete`, `cache delete`, `cache flushall`, `tags delete`
+`models block`, `fallbacks delete`, `cache delete`, `cache flushall`, `tags delete`, `callbacks delete`
 need `--yes` when there is no TTY (`cache settings update` needs it only to
 pin a row over a config-owned cache — see traps).
 
@@ -215,6 +223,20 @@ pin a row over a config-owned cache — see traps).
   that carries the tag, across all keys riding it — one cap for one feature
   that rides several keys. `tags delete` un-tags the keys and teams, deleting
   neither.
+- **Logging callbacks live in two places, and the delete endpoint reaches only
+  one.** The runtime view (`/callbacks/list`) is what this worker is calling
+  right now and includes internal loggers nobody configured; the stored view
+  (`/get/config/callbacks`) says where each one comes from and flags
+  runtime-only rows `read_only`. `POST /config/callback/delete` removes only
+  from the stored `success_callback` list — a failure or success_and_failure
+  callback or a read-only runtime logger is 404-able through it but not
+  deletable, which is why `callbacks delete` refuses it client-side with the
+  reason. Adding goes through `POST /config/update`, where `success_callback`
+  is unioned (additive) but any other `litellm_settings` key sent would be
+  *replaced* — the CLI only ever sends `success_callback` for that reason.
+  Both writes refuse a key config.yaml owns (the DB row would be shadowed at
+  every restart); an `otel` configured in config.yaml answers as the runtime
+  `otel`, and the CLI folds that alias when it compares or looks up.
 
 - **MCP servers have two sources, like models.** `mcp_servers:` in config.yaml
   shows as `SRC=config` (`is_config: true`): the API cannot change or delete it,
