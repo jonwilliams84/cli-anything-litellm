@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest import mock
 
 from cli_anything.litellm import litellm_cli as cli_mod
@@ -1374,3 +1375,167 @@ def test_workflow_keys_carry_a_tag_the_tag_table_caps_it_and_bills_it():
 
     r4 = run(["--json", "tags", "list"], get=get)
     assert [row["budget_id"] for row in json.loads(r4.output)] == ["eng-2026"]
+
+
+# ── callbacks (logging/observability), v0.15.0 ────────────────────────────
+
+
+def test_callbacks_list_shows_the_active_loggers_by_event_type():
+    from callback_fixtures import by_type_response
+
+    get = lambda c, p, **k: by_type_response() if p == "/callbacks/list" else {}
+    r = run(["callbacks", "list"], get=get)
+    assert r.exit_code == 0
+    assert r.output.strip().splitlines() == [
+        "ON       CALLBACK",
+        "success  langfuse",
+        "success  otel",
+    ]
+    rows = json.loads(run(["--json", "callbacks", "list"], get=get).output)
+    assert rows == [{"type": "success", "callback": "langfuse"}, {"type": "success", "callback": "otel"}]
+
+
+def test_callbacks_config_masks_every_credential_and_names_the_source():
+    from callback_fixtures import LANGFUSE_PUBLIC, LANGFUSE_SECRET, LAGO_KEY, SLACK_WEBHOOK, callbacks_config_response
+
+    res = callbacks_config_response()
+    get = lambda c, p, **k: res if p == "/get/config/callbacks" else {}
+    r = run(["callbacks", "config", "--alerts"], get=get)
+    assert r.exit_code == 0 and LANGFUSE_SECRET not in r.output and LAGO_KEY not in r.output and SLACK_WEBHOOK not in r.output
+    assert "runtime" in r.output and "otel" in r.output and "addable: datadog, langfuse" in r.output
+    out = json.loads(run(["--json", "callbacks", "config", "--alerts"], get=get).output)
+    lf = next(row for row in out["callbacks"] if row["name"] == "langfuse")
+    assert lf["type"] == "success" and lf["read_only"] is False
+    assert lf["variables"] == {
+        "LANGFUSE_PUBLIC_KEY": "****",
+        "LANGFUSE_SECRET_KEY": "****",
+        "LANGFUSE_HOST": "https://cloud.langfuse.com",
+    }
+    alert = out["alerts"][0]
+    assert alert["name"] == "slack" and alert["variables"]["SLACK_WEBHOOK_URL"] == "****"
+    assert out["available"] == sorted(["langfuse", "datadog"])
+    # the non-admin response is no worse here: its REDACTED passes through untouched
+    out2 = json.loads(run(["--json", "callbacks", "config"], get=lambda c, p, **k: callbacks_config_response(masked=True) if p == "/get/config/callbacks" else {}).output)
+    lf2 = next(row for row in out2["callbacks"] if row["name"] == "langfuse")
+    assert lf2["variables"]["LANGFUSE_SECRET_KEY"] == "REDACTED"
+
+
+def test_callbacks_add_dry_run_masks_the_resolved_secret_and_sends_nothing():
+    from callback_fixtures import callbacks_config_response
+
+    res = callbacks_config_response()
+    post = mock.Mock()
+    with mock.patch.dict(os.environ, {"DD_KEY": "dd-key-value-000123"}):
+        r = run(
+            ["--dry-run", "callbacks", "add", "datadog", "--env", "DD_API_KEY=os.environ/DD_KEY", "--env", "DD_SITE=us5.datadoghq.com"],
+            get=lambda c, p, **k: res if p == "/get/config/callbacks" else {},
+            post=post,
+        )
+    body = json.loads(r.output)["body"]
+    assert body["litellm_settings"] == {"success_callback": ["datadog"]}
+    assert body["environment_variables"] == {"DD_API_KEY": "****", "DD_SITE": "us5.datadoghq.com"}
+    assert "dd-key-value-000123" not in r.output
+    post.assert_not_called()
+
+
+def test_callbacks_add_posts_config_update_with_only_the_new_name():
+    from callback_fixtures import callbacks_config_response, update_ok
+
+    res = callbacks_config_response()
+    post = mock.Mock(return_value=update_ok())
+    r = run(["--json", "callbacks", "add", "datadog"], get=lambda c, p, **k: res if p == "/get/config/callbacks" else {}, post=post)
+    post.assert_called_once()
+    assert post.call_args.args[1:] == ("/config/update", {"litellm_settings": {"success_callback": ["datadog"]}})
+    assert json.loads(r.output) == update_ok()
+
+
+def test_callbacks_add_refuses_configured_runtime_and_unknown_before_the_proxy():
+    from callback_fixtures import callbacks_config_response
+
+    res = callbacks_config_response()
+    post = mock.Mock()
+    for name, hint in [("langfuse", "already configured"), ("otel", "runtime callback"), ("  ", "name the callback")]:
+        r = run(["callbacks", "add", name], get=lambda c, p, **k: res if p == "/get/config/callbacks" else {}, post=post)
+        assert r.exit_code != 0 and hint in r.output
+    post.assert_not_called()
+
+
+def test_callbacks_delete_refuses_yes_gate_then_deletes_lower_cased():
+    from callback_fixtures import callbacks_config_response, delete_ok
+
+    res = callbacks_config_response()
+    post = mock.Mock(return_value=delete_ok())
+    get = lambda c, p, **k: res if p == "/get/config/callbacks" else {}
+    r = run(["callbacks", "delete", "langfuse"], get=get, post=post)
+    assert r.exit_code != 0 and "without --yes" in r.output
+    post.assert_not_called()
+    r2 = run(["--json", "callbacks", "delete", "LANGFUSE", "--yes"], get=get, post=post)
+    assert post.call_args.args[1:] == ("/config/callback/delete", {"callback_name": "langfuse"})
+    assert json.loads(r2.output)["removed_callback"] == "langfuse"
+
+
+def test_callbacks_delete_refuses_what_the_endpoint_cannot_reach():
+    from callback_fixtures import callbacks_config_response
+
+    res = callbacks_config_response()
+    post = mock.Mock()
+    for name, hint in [("otel", "runtime callback"), ("lago", "/config/callback/delete only removes")]:
+        r = run(["callbacks", "delete", name, "--yes"], get=lambda c, p, **k: res if p == "/get/config/callbacks" else {}, post=post)
+        assert r.exit_code != 0 and hint in r.output
+    post.assert_not_called()
+
+
+# ── workflow: callbacks inspected, added, then deleted ────────────────────
+
+
+def test_workflow_callbacks_config_add_and_delete_stay_consistent():
+    """callbacks config is the view of record: it is what the add's refusal is
+    measured against, the dry-run body is the real body, and after the delete
+    the stored view and the active list both agree the callback is gone."""
+    from callback_fixtures import callbacks_config_response, delete_ok, update_ok
+
+    state: dict = {"rows": [dict(r) for r in callbacks_config_response()["callbacks"]]}
+
+    def get(c, p, **k):
+        if p == "/callbacks/list":
+            return {
+                "success": [r["name"] for r in state["rows"]],
+                "failure": [],
+                "success_and_failure": [],
+            }
+        return {"callbacks": state["rows"]} if p == "/get/config/callbacks" else {}
+
+    def post(c, path, body=None, **k):
+        if path == "/config/update":
+            name = body["litellm_settings"]["success_callback"][0]
+            state["rows"].append({"name": name, "type": "success", "variables": body.get("environment_variables", {})})
+            return update_ok()
+        if path == "/config/callback/delete":
+            name = body["callback_name"]
+            state["rows"] = [r for r in state["rows"] if r["name"] != name]
+            return delete_ok(name, remaining=tuple(r["name"] for r in state["rows"] if r["name"] != "otel"))
+        return {}
+
+    r0 = run(["callbacks", "list"], get=get)
+    assert "langfuse" in r0.output and "datadog" not in r0.output
+
+    r1 = run(["--dry-run", "callbacks", "add", "datadog"], get=get)
+    assert json.loads(r1.output)["body"] == {"litellm_settings": {"success_callback": ["datadog"]}}
+
+    r2 = run(["callbacks", "add", "datadog"], get=get, post=post)
+    assert r2.exit_code == 0
+
+    r3 = run(["callbacks", "add", "datadog"], get=get, post=post)
+    assert r3.exit_code != 0 and "already configured" in r3.output
+
+    r4 = run(["callbacks", "delete", "datadog"], get=get, post=post)
+    assert r4.exit_code != 0 and "without --yes" in r4.output
+
+    r5 = run(["callbacks", "delete", "datadog", "--yes"], get=get, post=post)
+    assert r5.exit_code == 0 and "deleted callback datadog" in r5.output
+
+    r6 = run(["callbacks", "delete", "datadog", "--yes"], get=get, post=post)
+    assert r6.exit_code != 0 and "no stored callback matches 'datadog'" in r6.output
+
+    r7 = run(["callbacks", "list"], get=get)
+    assert "datadog" not in r7.output and "langfuse" in r7.output

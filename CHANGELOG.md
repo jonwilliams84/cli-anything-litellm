@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.15.0] — 2026-11-09
+
+- Added `cli_anything/litellm/core/callbacks.py`, `tests/callback_fixtures.py`; updated `claude.md`, `readme.md`, `test.md`, `cli_anything/litellm/litellm_cli.py`, `cli_anything/litellm/skills/skill.md`, `skills/cli-anything-litellm/skill.md` and 2 more. (13 files changed, 1044 insertions(+), 10 deletions(-))
+
 ## [0.14.0] — 2026-10-31
 
 The tag table: from a free label on a key to a charged, capped chargeback unit.

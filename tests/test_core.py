@@ -842,3 +842,149 @@ def test_tag_delete_body_is_plural_and_requires_a_tag():
     assert tg.delete_body(["feat", "feat2"]) == {"tags": ["feat", "feat2"]}
     with pytest.raises(ValueError, match="TAG"):
         tg.delete_body([" ", ""])
+
+
+# ── callbacks (logging/observability) — core/callbacks.py ────────────────
+
+
+import os
+from unittest import mock
+
+from cli_anything.litellm.core import callbacks as cb
+
+from callback_fixtures import (
+    LANGFUSE_PUBLIC,
+    LANGFUSE_SECRET,
+    LAGO_KEY,
+    SLACK_WEBHOOK,
+    by_type_response,
+    by_type_scalar_response,
+)
+
+
+def cfg_rows():
+    return [
+        {"name": "langfuse", "type": "success", "variables": {"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk", "LANGFUSE_HOST": "https://cloud.langfuse.com"}},
+        {"name": "lago", "type": "success_and_failure", "variables": {"LAGO_API_KEY": "lk"}},
+        {"name": "otel", "type": "success", "variables": {}, "read_only": True},
+    ]
+
+
+def test_callback_by_type_tolerates_scalar_and_missing_and_none():
+    assert cb.as_by_type(by_type_response()) == {
+        "success": ["langfuse", "otel"],
+        "failure": [],
+        "success_and_failure": [],
+    }
+    assert cb.as_by_type(by_type_scalar_response()) == {
+        "success": ["langfuse"],
+        "failure": [],
+        "success_and_failure": [],
+    }
+    assert cb.as_by_type(None) == {"success": [], "failure": [], "success_and_failure": []}
+
+
+def test_callback_alias_folds_to_the_canonical_name():
+    assert cb.canonical_name("opentelemetry") == "otel"
+    assert cb.canonical_name("s3_v2") == "s3" and cb.canonical_name("aws_sqs") == "sqs"
+    assert cb.canonical_name("langfuse") == "langfuse"
+    # a proxy storing the alias and one storing the canonical name are the same callback
+    rows = [{"name": "opentelemetry", "type": "success", "variables": {}}, {"name": "lago", "type": "success", "variables": {}}]
+    assert cb.resolve(rows, "otel")["row"] is rows[0]
+
+
+def test_callback_as_rows_tolerates_envelopes_and_drops_junk():
+    assert cb.as_rows({"callbacks": cfg_rows()}) == cfg_rows()
+    assert cb.as_rows(cfg_rows()) == cfg_rows()
+    assert cb.as_rows({"data": cfg_rows()}) == cfg_rows()
+    assert cb.as_rows(None) == []
+    assert cb.as_rows("junk") == []
+    assert cb.as_rows({"callbacks": ["langfuse", {"name": "keep"}]}) == [{"name": "keep"}]
+
+
+def test_callback_normalize_defaults_type_and_redacts_variables():
+    got = cb.normalize({"name": "langfuse", "variables": {"LANGFUSE_SECRET_KEY": "sk-lf", "LANGFUSE_HOST": "https://x"}})
+    assert got == {"name": "langfuse", "type": "success", "read_only": False, "variables": {"LANGFUSE_SECRET_KEY": "****", "LANGFUSE_HOST": "https://x"}}
+    # a masked-once value (the proxy's or ours) passes through, None stays None
+    got = cb.normalize({"name": "lago", "type": "success_and_failure", "variables": {"LAGO_API_KEY": "REDACTED", "SMTP_HOST": None}})
+    assert got["variables"] == {"LAGO_API_KEY": "REDACTED", "SMTP_HOST": None}
+    assert cb.redact_variables("junk") == {}
+
+
+def test_callback_resolve_is_exact_case_insensitive_and_none():
+    rows = cfg_rows()
+    assert cb.resolve(rows, "LANGFUSE")["by"] == "name"
+    assert cb.resolve(rows, "ghost") is None and cb.resolve(rows, "") is None
+
+
+def test_callback_parse_envs_resolves_os_environ_and_refuses_literals():
+    with mock.patch.dict(os.environ, {"LF_SECRET": "sekret", "SITE": "us5.datadoghq.com"}):
+        envs = cb.parse_envs(["LANGFUSE_SECRET_KEY=os.environ/LF_SECRET", "DD_SITE=os.environ/SITE", "LANGFUSE_HOST=https://x"])
+    assert envs == {"LANGFUSE_SECRET_KEY": "sekret", "DD_SITE": "us5.datadoghq.com", "LANGFUSE_HOST": "https://x"}
+    with pytest.raises(ValueError, match="os.environ/NAME"):
+        cb.parse_envs(["LANGFUSE_SECRET_KEY=sk-literal"])
+    with mock.patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError, match="unset or empty"):
+            cb.parse_envs(["LANGFUSE_SECRET_KEY=os.environ/LF_SECRET"])
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        cb.parse_envs(["novalue", ""])
+
+
+def test_callback_add_body_sends_only_the_new_name_and_refuses_duplicates():
+    body = cb.add_body("datadog", cfg_rows())
+    assert body == {"litellm_settings": {"success_callback": ["datadog"]}}
+    with mock.patch.dict(os.environ, {"DD_API_KEY": "dk"}):
+        envs = cb.parse_envs(["DD_API_KEY=os.environ/DD_API_KEY"])
+    body = cb.add_body("datadog", cfg_rows(), envs)
+    assert body["environment_variables"] == {"DD_API_KEY": "dk"}
+    # already configured (any type), a runtime row, or no name at all
+    with pytest.raises(ValueError, match="already configured"):
+        cb.add_body("langfuse", cfg_rows())
+    with pytest.raises(ValueError, match="runtime callback"):
+        cb.add_body("otel", cfg_rows())
+    with pytest.raises(ValueError, match="name the callback"):
+        cb.add_body("  ", cfg_rows())
+
+
+def test_callback_masked_body_hides_env_and_plain_names_only():
+    with mock.patch.dict(os.environ, {"DD_API_KEY": "dk"}):
+        body = cb.add_body("datadog", cfg_rows(), cb.parse_envs(["DD_API_KEY=os.environ/DD_API_KEY", "DD_SITE=us5"]))
+    shown = cb.masked_body(body, {"DD_API_KEY": "dk"})
+    assert shown["environment_variables"] == {"DD_API_KEY": "****", "DD_SITE": "us5"}
+    assert cb.masked_body({"litellm_settings": {"success_callback": ["x"]}}, None) == {"litellm_settings": {"success_callback": ["x"]}}
+
+
+def test_callback_delete_body_lowercases_and_refuses_unreachables():
+    assert cb.delete_body(cfg_rows(), "LANGFUSE") == {"callback_name": "langfuse"}
+    with pytest.raises(ValueError, match="no stored callback"):
+        cb.delete_body(cfg_rows(), "galileo")
+    with pytest.raises(ValueError, match="runtime callback"):
+        cb.delete_body(cfg_rows(), "otel")
+    with pytest.raises(ValueError, match="/config/callback/delete only removes"):
+        cb.delete_body(cfg_rows(), "lago")
+
+
+def test_callback_available_and_alerts_read_the_stored_view():
+    import callback_fixtures as fx
+
+    res = fx.callbacks_config_response()
+    assert cb.available(res)["datadog"] == ["DD_API_KEY", "DD_SITE"]
+    assert cb.available("junk") == {}
+    alerts = cb.alerts(res)
+    assert alerts[0]["name"] == "slack" and alerts[0]["active_alerts"] == ["catch_all", "budget_alerts"]
+    assert alerts[0]["variables"]["SLACK_WEBHOOK_URL"] == "****"
+    assert alerts[1]["variables"]["SMTP_HOST"] == "smtp.example"
+    assert cb.alerts(None) == []
+
+
+def test_callback_every_fixture_secret_is_masked_in_normalized_rows():
+    import callback_fixtures as fx
+
+    for masked in (False, True):
+        rows = [cb.normalize(r) for r in cb.as_rows(fx.callbacks_config_response(masked=masked).get("callbacks"))]
+        flat = json.dumps(rows)
+        for secret in (LANGFUSE_SECRET, LAGO_KEY, SLACK_WEBHOOK, "sk-lf", "lago-api-key"):
+            assert secret not in flat
+        # a public key is masked the same way under both roles (mask-more, never leak)
+        assert any(r["variables"].get("LANGFUSE_PUBLIC_KEY") == "****" for r in rows if r["name"] == "langfuse")
+        assert LANGFUSE_PUBLIC not in flat
