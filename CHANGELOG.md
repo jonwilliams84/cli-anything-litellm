@@ -2,7 +2,75 @@
 
 ## [0.15.0] — 2026-11-09
 
-- Added `cli_anything/litellm/core/callbacks.py`, `tests/callback_fixtures.py`; updated `claude.md`, `readme.md`, `test.md`, `cli_anything/litellm/litellm_cli.py`, `cli_anything/litellm/skills/skill.md`, `skills/cli-anything-litellm/skill.md` and 2 more. (13 files changed, 1044 insertions(+), 10 deletions(-))
+The logging callbacks: from a line in readiness to running them.
+
+The CLI saw the proxy's observability integrations only as the `callbacks`
+list in `status`/`health` readiness output — which integrations actually log
+(or bill) every request (Langfuse, OpenTelemetry, S3, Datadog, Langsmith,
+Lago, a custom HTTP endpoint…), where each one is configured from, what
+variables it carries, and how to add or stop one, all needed the Admin UI or
+a `curl` against the config endpoints. The mutations are admin-only and write
+only the DB store (they need a connected DB), and `success_callback` is the
+one `litellm_settings` key the proxy *adds to* rather than replaces. Now
+(shapes from v1.106.3, `litellm/proxy/management_endpoints/callback_management_endpoints.py`
+and `proxy_server.py`'s `get_config` / `update_config` / `delete_callback`):
+
+- **`callbacks list`** (`GET /callbacks/list`): what is *active on this worker
+  right now* — the `CallbacksByType` view as one row per callback per event
+  type (success, failure, success_and_failure). Scalar members (older
+  proxies), missing lists and `None` tolerated; it includes internal loggers
+  (spend tracking, alerting) nobody configured and that cannot be deleted.
+  Alias folding (`opentelemetry`→`otel`, `s3_v2`→`s3`, `aws_sqs`→`sqs`,
+  `custom_callback_api`→`generic_api`) so a callback configured under one
+  spelling never looks like two callbacks.
+- **`callbacks config`** (`GET /get/config/callbacks`): the stored view — one
+  row per configured callback: its event type, where it comes from (`stored`,
+  or `runtime` for `read_only` rows: the runtime loggers the delete endpoint
+  cannot reach) and its environment variables with every credential-named
+  value masked, whatever role the key carries (the proxy hands real values to
+  an admin key and its own `REDACTED` to a non-admin one; both pass through
+  the same mask, idempotently). `--alerts` adds the Slack/email/Teams
+  alerting destinations (the webhook URL masked); `--json` adds `available`,
+  the catalogue of callbacks the Admin UI can add and the variables each
+  expects — what `callbacks add` works from.
+- **`callbacks add <name>`** (`POST /config/update`): DB-stored, survives
+  restarts. The CLI sends only `litellm_settings.success_callback` — the
+  proxy unions it over the stored list and dedupes, so callbacks already
+  logging keep logging; any other `litellm_settings` key in the body would be
+  *replaced* by the request's value, so the CLI sends none. `--env
+  K=value` (repeatable) rides as the `environment_variables` section, which
+  the proxy encrypts at rest; a value that names a credential must be an
+  `os.environ/NAME` ref — a literal is refused before anything is sent.
+  `--dry-run` prints the exact body with resolved secrets shown as `****`
+  (plain non-secret values are not masked — they are needed for checking).
+  Refused client-side, before the proxy, when a callback of the name is
+  already configured (the stored view is the measure), when the name matches
+  a read-only runtime logger, or when the name is blank.
+- **`callbacks delete <name>`** (`POST /config/callback/delete`, body
+  `{"callback_name": …}` lower-cased, as the endpoint looks names up):
+  removes only from the stored `success_callback` list — a runtime
+  (`read_only`) row, a failure / success_and_failure callback or an unknown
+  name is refused client-side with the reason, which the endpoint's bare 404
+  does not say. Keys and requests keep working; only logging stops.
+  `--yes`-gated off a TTY, dry-runnable.
+
+Both mutations are refused by the proxy itself (HTTP 400 with a
+`resolution` in the error detail) when config.yaml owns the key — the DB row
+would never win over the file at the next restart; this CLI surfaces the
+resolution rather than repeating the call.
+
+### The stored view is the view of record
+
+`callbacks config` drives every mutation check: the add's
+"already configured" refusal, the delete's exact row and refusal reasons,
+and, after a delete, both the stored view and the active list agreeing the
+callback is gone.
+
+The mutating bodies were not run live (admin-only with the DB required);
+their shapes come from the proxy's config endpoints, and the fixtures
+(`tests/callback_fixtures.py`) cite what each call is modelled on. As ever
+with a proxy whose shape differs, capture the shape into a test before
+changing code.
 
 ## [0.14.0] — 2026-10-31
 
