@@ -184,3 +184,164 @@ def totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "prompt_tokens": round(sum(_num(r.get("prompt_tokens")) for r in rows)),
         "completion_tokens": round(sum(_num(r.get("completion_tokens")) for r in rows)),
     }
+
+
+# ── activity and prediction (/global/activity/*, /global/predict/*) ────────
+
+ACTIVITY_KINDS = ("user", "model", "exception", "latency")
+
+# CLI activity kind -> the endpoint behind it. The exception and latency
+# endpoints are per model group (a path segment the shell user gives to
+# --model); the other two are proxy-wide.
+_ACTIVITY_PATHS: dict[str, str] = {
+    "user": "/global/activity/daily_active_users_and_spend",
+    "model": "/global/activity/model",
+    "exception": "/global/activity/exceptions",
+    "latency": "/global/activity/latency",
+}
+
+_MONEY_FIELDS = ("spend", "total_spend", "predicted_spend", "estimated_spend")
+_DATE_FIELDS = ("predicted_start_date", "predicted_end_date")
+
+
+def activity_path(kind: str, model: str | None = None) -> str:
+    """The endpoint for ``kind`` — with the model group in the path where the
+    proxy wants it. ``exception`` and ``latency`` are defined per model group:
+    a missing ``--model`` raises ValueError (message meant for Click)."""
+    base = _ACTIVITY_PATHS[kind]
+    if kind in ("exception", "latency"):
+        if not model:
+            raise ValueError(f"--by {kind} needs --model (these are recorded per model group)")
+        from urllib.parse import quote
+
+        return f"{base}/{quote(model, safe='')}"
+    return base
+
+
+def activity_rows(res: Any) -> list[dict[str, Any]]:
+    """Whatever an activity endpoint returned, as a list of day rows.
+
+    The proxy sent ``{"data": [...], "metadata": {...}}`` on current versions
+    and has sent bare lists and other envelope keys elsewhere; anything else
+    is treated as no rows rather than a crash. ``metadata`` is read by the
+    caller via :func:`activity_metadata`.
+    """
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict):
+        for key in ("data", "daily", "rows"):
+            if isinstance(res.get(key), list):
+                return res[key]
+    return []
+
+
+def activity_metadata(res: Any) -> dict[str, Any] | None:
+    """The endpoint's ``metadata`` envelope, when it carries one."""
+    if isinstance(res, dict) and isinstance(res.get("metadata"), dict):
+        return res["metadata"]
+    return None
+
+
+def normalize_activity(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """Activity day rows in one shape per kind, the way ``normalize`` treats
+    report rows.
+
+    - ``user``: ``{date, active_users, spend}`` — the daily-active-users row
+      either names its counts directly (``num_daily_active_users``/
+      ``total_spend``) or as a scalar ``value``.
+    - ``model``: the row's ``value`` dict maps model → requests per day, and
+      that nests the whole day inside one row — one output row per model per
+      day, the way ``spend --by tag`` splits a day's tags. ``{date, model,
+      requests}``. A scalar ``value`` (older shape) becomes the model-less
+      day total.
+    - ``exception``: ``value`` maps exception type → count; one row per type:
+      ``{date, exception, count}``. Scalar ``value`` is the day total.
+    - ``latency``: ``value`` maps latency metric → milliseconds
+      (``latency_ms_p50``/``p95``/``p99`` …); flattened onto the day row.
+
+    Rows arrive newest first; junk rows (non-dict, or a non-dict numeric
+    ``value`` on the expanding kinds) are kept where they still describe a
+    day and dropped where they would crash the table — same tolerance as the
+    report envelope.
+    """
+    out: list[dict[str, Any]] = []
+    for raw in rows or []:
+        if not isinstance(raw, dict):
+            continue
+        date_str = str(raw.get("date") or "")[:10]
+        value = raw.get("value")
+        if kind == "user":
+            users = raw.get("num_daily_active_users")
+            if users is None:
+                users = raw.get("active_users")
+            if users is None:
+                users = value
+            out.append(
+                {
+                    "date": date_str,
+                    "active_users": round(_num(users)),
+                    "spend": round(_num(raw.get("total_spend", raw.get("spend"))), 4),
+                }
+            )
+        elif kind == "model":
+            if isinstance(value, dict):
+                out.extend(
+                    {
+                        "date": date_str,
+                        "model": "(all)" if model_name is None else str(model_name),
+                        "requests": round(_num(requests)),
+                    }
+                    for model_name, requests in value.items()
+                )
+            elif value is not None:
+                out.append({"date": date_str, "model": "(all)", "requests": round(_num(value))})
+        elif kind == "exception":
+            if isinstance(value, dict):
+                out.extend(
+                    {
+                        "date": date_str,
+                        "exception": str(exc_name),
+                        "count": round(_num(exc_count)),
+                    }
+                    for exc_name, exc_count in value.items()
+                )
+            else:
+                out.append({"date": date_str, "exception": "(all)", "count": round(_num(value))})
+        else:  # latency
+            row = {"date": date_str, "latency_ms_p50": 0.0, "latency_ms_p95": 0.0, "latency_ms_p99": 0.0}
+            if isinstance(value, dict):
+                for metric, ms in value.items():
+                    row[str(metric)] = round(_num(ms), 4)
+            else:
+                row["latency_ms_p50"] = round(_num(value), 4)
+            out.append(row)
+    return sorted(out, key=lambda r: r["date"], reverse=True)
+
+
+def prediction(res: Any) -> dict[str, Any]:
+    """The ``/global/predict/spend/fixed_duration`` response, normalized.
+
+    The endpoint predicts the spend for the next window of the same length
+    from the window's recorded spend, and has carried ``predicted_spend`` and
+    ``estimated_spend`` spellings across versions; the four money fields are
+    coerced to floats, the dates kept as strings. Anything unexpected is a
+    null rather than a crash — ``--json`` callers still get a dict.
+    """
+    if not isinstance(res, dict):
+        return {
+            "spend": None,
+            "predicted_spend": None,
+            "predicted_start_date": None,
+            "predicted_end_date": None,
+        }
+    out: dict[str, Any] = {}
+    for f in _MONEY_FIELDS:
+        if res.get(f) is not None:
+            out[f] = round(_num(res.get(f)), 4)
+    for f in _DATE_FIELDS:
+        if res.get(f) is not None:
+            out[f] = str(res.get(f))[:10]
+    for f in ("start_date", "end_date"):
+        if res.get(f) is not None:
+            out[f] = str(res.get(f))[:10]
+    return out
