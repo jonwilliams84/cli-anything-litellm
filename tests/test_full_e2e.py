@@ -1232,6 +1232,112 @@ def test_workflow_spend_by_key_and_usage_report_agree_and_logs_drill_down():
     assert r3.exit_code == 0 and r3.output.count("qwen") == 2
 
 
+# ── usage activity / usage predict (the /global/activity + forecast reads) ─
+
+DAU_ROWS = {
+    "data": [
+        {"date": "2026-11-02T00:00:00", "num_daily_active_users": 5, "total_spend": 12.5},
+        {"date": "2026-11-01", "num_daily_active_users": 3, "total_spend": 8.0, "junk": "ignored"},
+    ],
+    "metadata": {"total_daily_active_users": 7},
+}
+
+
+def test_usage_activity_dau_is_the_default_and_posts_the_window():
+    post = mock.Mock(return_value=DAU_ROWS)
+    r = run(["usage", "activity", "--days", "7"], post=post)
+    assert r.exit_code == 0
+    assert post.call_args.args[1] == "/global/activity/daily_active_users_and_spend"
+    body = post.call_args.args[2]
+    assert set(body) == {"start_date", "end_date"}
+    assert "2026-11-02" in r.output and "12.5" in r.output and "ACTIVE" in r.output
+
+
+def test_usage_activity_json_carries_window_by_rows_and_metadata():
+    r = run(["--json", "usage", "activity", "--by", "user", "--days", "7"], post=mock.Mock(return_value=DAU_ROWS))
+    out = json.loads(r.output)
+    assert r.exit_code == 0
+    assert out["by"] == "user" and out["window"]["start_date"]
+    assert out["rows"][0] == {"date": "2026-11-02", "active_users": 5, "spend": 12.5}
+    assert out["metadata"] == {"total_daily_active_users": 7}
+
+
+def test_usage_activity_model_expands_one_row_per_model():
+    res = {"data": [{"date": "2026-11-01", "value": {"qwen": 3, "gpt-4o": "1"}}]}
+    r = run(["--json", "usage", "activity", "--by", "model", "--days", "7"], post=mock.Mock(return_value=res))
+    out = json.loads(r.output)
+    assert r.exit_code == 0 and out["rows"] == [
+        {"date": "2026-11-01", "model": "qwen", "requests": 3},
+        {"date": "2026-11-01", "model": "gpt-4o", "requests": 1},
+    ]
+    r2 = run(["usage", "activity", "--by", "model", "--days", "7"], post=mock.Mock(return_value=res))
+    assert "qwen" in r2.output and "gpt-4o" in r2.output and "REQUESTS" in r2.output
+
+
+def test_usage_activity_exception_and_latency_fail_before_the_proxy_without_model():
+    post = mock.Mock()
+    r = run(["usage", "activity", "--by", "exception", "--days", "7"], post=post)
+    assert r.exit_code != 0 and "--model" in r.output
+    r2 = run(["usage", "activity", "--by", "latency", "--days", "7"], post=post)
+    assert r2.exit_code != 0
+    post.assert_not_called()
+
+
+def test_usage_activity_exception_and_latency_target_the_group_path_and_body():
+    post = mock.Mock(
+        side_effect=[
+            {"data": [{"date": "2026-11-01", "value": {"timeout": 2}}]},
+            {"data": [{"date": "2026-11-01", "value": {"latency_ms_p50": 4.0, "latency_ms_p95": 5.0, "latency_ms_p99": 5.4}}]},
+        ]
+    )
+    args = ["--json", "usage", "activity", "--model", "hosted_vllm/qwen", "--start", "2026-11-01", "--end", "2026-11-02"]
+    r = run([*args, "--by", "exception"], post=post)
+    out = json.loads(r.output)
+    assert post.call_args_list[0].args[1] == "/global/activity/exceptions/hosted_vllm%2Fqwen"
+    assert out["window"] == {"start_date": "2026-11-01", "end_date": "2026-11-02"}
+    assert out["rows"] == [{"date": "2026-11-01", "exception": "timeout", "count": 2}]
+    r2 = run([*args, "--by", "latency"], post=post)
+    out2 = json.loads(r2.output)
+    assert post.call_args_list[1].args[1] == "/global/activity/latency/hosted_vllm%2Fqwen"
+    assert out2["rows"][0]["latency_ms_p95"] == 5.0
+
+
+def test_usage_predict_posts_the_fixed_duration_and_forecasts():
+    res = {"spend": 6.5, "predicted_spend": 8.1, "predicted_start_date": "2026-11-17T00:00:00", "predicted_end_date": "2026-11-24"}
+    post = mock.Mock(return_value=res)
+    r = run(["--json", "usage", "predict", "--days", "7"], post=post)
+    out = json.loads(r.output)
+    assert r.exit_code == 0
+    assert post.call_args.args[1] == "/global/predict/spend/fixed_duration"
+    assert post.call_args.args[2] == out["window"]
+    assert out["predicted_spend"] == 8.1 and out["predicted_start_date"] == "2026-11-17"
+    r2 = run(["usage", "predict", "--days", "7"], post=mock.Mock(return_value=res))
+    assert "8.1" in r2.output and "2026-11-17 .. 2026-11-24" in r2.output
+
+
+def test_usage_predict_window_errors_before_the_proxy():
+    post = mock.Mock()
+    r = run(["usage", "predict", "--start", "2026-11-01"], post=post)
+    assert r.exit_code != 0 and "go together" in r.output
+    post.assert_not_called()
+
+
+def test_workflow_usage_report_and_activity_and_predict_share_one_window():
+    """The money view, the traffic view and the forecast are asked about the
+    same window — one `--days/--start/--end` answer for all three."""
+    post = mock.Mock(return_value=DAU_ROWS)
+    get = mock.Mock(return_value=[{"date": "2026-11-02", "team_id": "t", "spend": 12.5}])
+    r_act = run(["--json", "usage", "activity", "--by", "user", "--days", "7"], get=get, post=post)
+    r_rep = run(["--json", "usage", "report", "--by", "day", "--days", "7"], get=get, post=post)
+    act, rep = json.loads(r_act.output), json.loads(r_rep.output)
+    assert act["window"] == rep["window"]
+    body = post.call_args.args[2]
+    assert body == act["window"]
+    r_pred = run(["--json", "usage", "predict", "--days", "7"], get=get, post=post)
+    assert json.loads(r_pred.output)["window"] == act["window"]
+    assert rep["spend"] == 12.5
+
+
 # ── tags (the proxy's tag table) ──────────────────────────────────────────
 
 

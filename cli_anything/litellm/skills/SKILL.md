@@ -119,6 +119,8 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | Which logging integrations actually run (Langfuse, OTEL, S3, Datadog, Langsmith, Lago…) and when do they fire? | `callbacks list` (active on the worker, by event type: success / failure / success_and_failure), `callbacks config [--alerts]` (stored rows: their event type, where they come from — `read_only` = runtime, not yours to delete — and each callback's own variables, credential-masked; `--alerts` adds the Slack/email/Teams destinations) |
 | Add (or stop) logging to an integration | `callbacks add <name> --env KEY=os.environ/VAR [--dry-run]` (DB-stored: the proxy unions the name over the stored success list, so other callbacks keep logging; variables are encrypted at rest), `callbacks delete <name> --yes` (only DB-stored success callbacks — runtime or failure-type ones are refused with the reason). `callbacks config --json`'s `available` names every addable callback and the variables each expects |
 | What did the month cost (a window too wide to download raw logs for)? | `usage report [--by day|team|api_key|model|customer] [--days 7]` or `--start YYYY-MM-DD --end YYYY-MM-DD` — the proxy's own DB aggregation behind the Admin UI's charts; api_key rows are named exactly like `spend --by key` |
+| Who used the proxy last month, on what, and how badly did it go? | `usage activity --by user` (daily active end users + their spend), `--by model` (requests per model per day), `--by exception|--by latency --model g` — the other half of the Admin UI's Usage tab, straight from the proxy's DB (`/global/activity/*`), one small response instead of a log download |
+| What will next week cost? | `usage predict [--days 7 |--start --end]` — `/global/predict/spend/fixed_duration`: forecasts the next window of the same length from what this one spent |
 | What tags have their own rules? | `tags list` — the proxy's tag table (`/tag/list`): description, keys, models, budget_id; a config-declared tag that no table row backs appears as a bare name |
 | Cap one feature across all the keys that carry it | `tags update <tag> --budget-id B [--description D] [--models m1,m2] [--keys k1,k2]` — POST /tag/update, an UPSERT (there is no /tag/create: a name not in the table gets its row created); it replaces the whole row, so the current values are merged in and each flag overrides, like `keys update` |
 | Retire a tag from the table | `tags delete <tag> --yes` — POST /tag/delete `{"tags": [...]}`: strips the tag from the keys and teams riding it and deletes the row; it deletes no key. Refused when no live tag matches |
@@ -378,6 +380,16 @@ pin a row over a config-owned cache — see traps).
   `logs list`. The report's `api_key` rows are sha256 hashes, named the same
   way `spend --by key` names callers; `--by day` is summed client-side (the
   endpoint has no day-only form), so it is still a single small response.
+- **The Usage tab is more than money.** `usage activity` reads
+  `/global/activity/*` — daily active end users (`--by user`, with the day's
+  spend), request volume per model (`--by model`, the day's `value` dict
+  split one row per model per day), and exceptions and latency, which the
+  proxy records per model group (`--by exception|--by latency --model g`, the
+  group URL-quoted in the path). `usage predict`
+  (`/global/predict/spend/fixed_duration`) forecasts the next window of the
+  same length from what this one spent. activity, report and predict POST /
+  send the same `{start_date, end_date}` window, so one
+  `--days/--start/--end` answer is shared by all three.
 
 ## Site policy files
 

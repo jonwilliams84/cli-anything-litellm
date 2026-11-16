@@ -3276,6 +3276,101 @@ def usage_report(ctx, group_by, days, start, end, limit):
     _emit(ctx, data, human)
 
 
+@usage_grp.command("activity")
+@click.option(
+    "--by",
+    type=click.Choice(usage_mod.ACTIVITY_KINDS),
+    default="user",
+    help=(
+        "Proxy-wide daily active users and spend (default), per-model request volume, or "
+        "exceptions and latency recorded per model group."
+    ),
+)
+@click.option(
+    "--model", "model_group", default=None, help="Model group, required for --by exception/latency."
+)
+@click.option("--days", default=7, type=int, help="Window in days (used without --start/--end).")
+@click.option("--start", default=None, help="Window start, YYYY-MM-DD. Requires --end; overrides --days.")
+@click.option("--end", default=None, help="Window end (inclusive), YYYY-MM-DD. Requires --start.")
+@click.pass_context
+def usage_activity(ctx, by, model_group, days, start, end):
+    """Traffic the /global/spend/report view does not carry: who used the proxy,
+    what, and how badly it went — the numbers behind the Admin UI's Usage tab.
+
+    `usage report` is money only; these endpoints answer the other half of the
+    same window from the proxy's own database: daily active end users
+    (`--by user`, with the day's spend alongside), request volume per model
+    (`--by model`), and the exceptions and latency recorded per model group
+    (`--by exception` / `--by latency`, which need `--model`). One small
+    response per endpoint instead of a log download.
+    """
+    c = _conn(ctx)
+    try:
+        win = usage_mod.window(days, start, end)
+        path = usage_mod.activity_path(by, model_group)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    res = _call(be.post, c, path, win)
+    meta = usage_mod.activity_metadata(res)
+    rows = usage_mod.normalize_activity(usage_mod.activity_rows(res), by)
+    data = {
+        "window": win,
+        "by": by,
+        **({"model": model_group} if model_group else {}),
+        "rows": rows,
+        **({"metadata": meta} if meta else {}),
+    }
+
+    def human(d):
+        head = f"activity {d['window']['start_date']} .. {d['window']['end_date']} by {d['by']}"
+        if d.get("model"):
+            head += f" (model {d['model']})"
+        click.echo(head + ":")
+        cols = [("date", "DATE")]
+        seen: list[str] = []
+        for r in d["rows"]:
+            for k in r:
+                if k != "date" and k not in seen:
+                    seen.append(k)
+        cols += [(k, k.replace("_", " ").upper()) for k in seen]
+        _table(d["rows"], cols)
+
+    _emit(ctx, data, human)
+
+
+@usage_grp.command("predict")
+@click.option("--days", default=7, type=int, help="Window in days (used without --start/--end).")
+@click.option("--start", default=None, help="Window start, YYYY-MM-DD. Requires --end; overrides --days.")
+@click.option("--end", default=None, help="Window end (inclusive), YYYY-MM-DD. Requires --start.")
+@click.pass_context
+def usage_predict(ctx, days, start, end):
+    """Forecast the spend for the next window of the same length (/global/predict/spend/fixed_duration).
+
+    The proxy predicts from its own spend log: it reads what the window cost
+    and returns what it expects the next window of the same length to cost.
+    Capacity and budget decisions without waiting for the invoice.
+    """
+    c = _conn(ctx)
+    try:
+        win = usage_mod.window(days, start, end)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    res = _call(be.post, c, "/global/predict/spend/fixed_duration", win)
+    pred = usage_mod.prediction(res)
+    data = {"window": win, **pred}
+
+    def human(d):
+        """The one-line forecast: what the window spent, what the next expects."""
+        src = d.get("predicted_start_date") or d["window"]["start_date"]
+        dst = d.get("predicted_end_date") or d["window"]["end_date"]
+        click.echo(
+            f"window {d['window']['start_date']} .. {d['window']['end_date']} spend ${d.get('spend', '?')}"
+        )
+        click.echo(f"predicted {src} .. {dst}: ${d.get('predicted_spend', '?')}")
+
+    _emit(ctx, data, human)
+
+
 # ── mcp (the proxy's MCP gateway) ──────────────────────────────────────────
 
 

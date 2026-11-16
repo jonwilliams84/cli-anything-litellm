@@ -775,6 +775,131 @@ def test_totals_roll_up_the_window():
     assert usg.totals([]) == {"rows": 0, "days": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
 
 
+def test_activity_path_per_kind_and_per_model_group():
+    assert usg.activity_path("user") == "/global/activity/daily_active_users_and_spend"
+    assert usg.activity_path("model") == "/global/activity/model"
+    assert usg.activity_path("exception", "qwen") == "/global/activity/exceptions/qwen"
+    assert usg.activity_path("latency", "gpt-4o") == "/global/activity/latency/gpt-4o"
+
+
+def test_activity_path_slashes_in_group_names_are_escaped():
+    # a group name like hosted_vllm/qwen must survive as one path segment
+    assert usg.activity_path("latency", "hosted_vllm/qwen") == "/global/activity/latency/hosted_vllm%2Fqwen"
+
+
+def test_activity_path_requires_the_model_group_for_exception_and_latency():
+    with pytest.raises(ValueError, match="needs --model"):
+        usg.activity_path("exception")
+    with pytest.raises(ValueError, match="needs --model"):
+        usg.activity_path("latency")
+    usg.activity_path("user")  # the proxy-wide kinds never need one
+
+
+def test_activity_rows_tolerate_the_envelopes():
+    assert usg.activity_rows([{"date": "d"}]) == [{"date": "d"}]
+    assert usg.activity_rows({"data": [{"date": "d"}], "metadata": {"total": 1}}) == [{"date": "d"}]
+    assert usg.activity_rows({"daily": ["x"]}) == ["x"]
+    assert usg.activity_rows({}) == [] and usg.activity_rows(None) == []
+
+
+def test_activity_metadata_is_only_a_dict_envelope():
+    assert usg.activity_metadata({"metadata": {"n": 1}}) == {"n": 1}
+    assert usg.activity_metadata({"data": []}) is None
+    assert usg.activity_metadata("junk") is None
+
+
+def test_normalize_activity_user_names_and_scalar_value_fallback():
+    rows = usg.normalize_activity(
+        [
+            {"date": "2026-11-02T12:00:00", "num_daily_active_users": "5", "total_spend": 12.5},
+            {"date": "2026-11-01", "value": 3},  # older shape: the scalar value carries the count
+            {"date": "2026-11-01", "active_users": 2, "spend": "1.5"},
+            "junk-row",
+        ],
+        "user",
+    )
+    assert rows == [
+        {"date": "2026-11-02", "active_users": 5, "spend": 12.5},
+        {"date": "2026-11-01", "active_users": 3, "spend": 0.0},
+        {"date": "2026-11-01", "active_users": 2, "spend": 1.5},
+    ]
+
+
+def test_normalize_activity_model_value_dict_splits_one_row_per_model():
+    rows = usg.normalize_activity(
+        [{"date": "2026-11-01", "value": {"gpt-4o": 3, "qwen": "4", None: 1}}, "junk"],
+        "model",
+    )
+    assert rows == [
+        {"date": "2026-11-01", "model": "gpt-4o", "requests": 3},
+        {"date": "2026-11-01", "model": "qwen", "requests": 4},
+        {"date": "2026-11-01", "model": "(all)", "requests": 1},  # None key: a day total, not a model
+    ]
+
+
+def test_normalize_activity_scalar_model_value_is_the_day_total():
+    assert usg.normalize_activity([{"date": "d", "value": 7}], "model") == [
+        {"date": "d", "model": "(all)", "requests": 7}
+    ]
+    assert usg.normalize_activity([{"date": "d"}], "model") == []  # nothing to count: no row, no fake zero
+
+
+def test_normalize_activity_exception_dict_and_scalar():
+    rows = usg.normalize_activity(
+        [{"date": "d", "value": {"timeout": 3, "APIConnectionError": "1"}}, {"date": "d2"}],
+        "exception",
+    )
+    assert rows == [
+        {"date": "d2", "exception": "(all)", "count": 0},
+        {"date": "d", "exception": "timeout", "count": 3},
+        {"date": "d", "exception": "APIConnectionError", "count": 1},
+    ]
+    scalar = usg.normalize_activity([{"date": "d", "value": 4}], "exception")
+    assert scalar == [{"date": "d", "exception": "(all)", "count": 4}]
+
+
+def test_normalize_activity_latency_flattens_metrics_onto_the_day_row():
+    rows = usg.normalize_activity(
+        [{"date": "2026-11-02", "value": {"latency_ms_p50": 1.0, "latency_ms_p95": "2.0", "latency_ms_p99": 3}}],
+        "latency",
+    )
+    assert rows == [{"date": "2026-11-02", "latency_ms_p50": 1.0, "latency_ms_p95": 2.0, "latency_ms_p99": 3.0}]
+
+
+def test_normalize_activity_scalar_latency_and_newest_day_first():
+    rows = usg.normalize_activity([{"date": "d2", "value": 5}, {"date": "d3"}], "latency")
+    assert rows[0]["date"] == "d3" and rows[0]["latency_ms_p50"] == 0.0
+    assert rows[1] == {"date": "d2", "latency_ms_p50": 5.0, "latency_ms_p95": 0.0, "latency_ms_p99": 0.0}
+
+
+def test_prediction_normalizes_the_shapes_of_the_fields_it_knows():
+    pred = usg.prediction(
+        {
+            "spend": 7,
+            "predicted_spend": "12.54321",
+            "predicted_start_date": "2026-11-18T00:00:00",
+            "predicted_end_date": "2026-11-25",
+        }
+    )
+    assert pred == {
+        "spend": 7.0,
+        "predicted_spend": 12.5432,
+        "predicted_start_date": "2026-11-18",
+        "predicted_end_date": "2026-11-25",
+    }
+
+
+def test_prediction_carries_both_spellings_and_nothing_else():
+    assert usg.prediction({"estimated_spend": 4, "spend": 1})["estimated_spend"] == 4.0
+    assert usg.prediction({}) == {}  # absent fields stay absent
+
+
+def test_prediction_keeps_bare_window_dates_so_human_heads_have_something():
+    pred = usg.prediction({"start_date": "2026-11-11T00:00", "end_date": "2026-11-18T00:00"})
+    assert pred == {"start_date": "2026-11-11", "end_date": "2026-11-18"}
+    assert usg.prediction("junk") == {"spend": None, "predicted_spend": None, "predicted_start_date": None, "predicted_end_date": None}
+
+
 # ── tag management (/tag/*) ───────────────────────────────────────────────
 
 from cli_anything.litellm.core import tags as tg

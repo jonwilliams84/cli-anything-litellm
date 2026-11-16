@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.16.0] — 2026-11-16
+
+The Usage tab is more than money. `usage report` asked the proxy's
+`/global/spend/report` — the DB aggregation behind the Admin UI's spend
+charts — but the rest of that tab's data (who actually used the proxy, which
+models are carrying the traffic, what is failing, how slow answers are) and
+its spend forecast had no surface: every one of those questions meant the raw
+log download or the Admin UI. The proxy exposes them server-side on
+`POST /global/activity/*` and `POST /global/predict/spend/fixed_duration`;
+now (in `core/usage.py`, sharing the report's window builder and shape
+tolerance):
+
+- **`usage activity`** — the traffic, failure and latency views over the
+  window:
+  - `--by user` (default): `/global/activity/daily_active_users_and_spend` —
+    daily active end users with each day's spend alongside.
+  - `--by model`: `/global/activity/model` — request volume per model; the
+    day's `value` dict (model → requests) is split client-side into one row
+    per model per day, the way `spend --by tag` splits a day's tags.
+  - `--by exception` / `--by latency`: `/global/activity/exceptions/<group>`
+    and `/global/activity/latency/<group>` — what broke (exceptions by type)
+    and the p50/p95/p99 latency, which the proxy records per model group.
+    These require `--model`, refused before the proxy is called; group names
+    with `/` are URL-quoted into the path segment.
+- **`usage predict`** — `/global/predict/spend/fixed_duration`: forecasts
+  what the *next* window of the same length will cost from what this window
+  spent. Capacity and budget decisions without waiting for the invoice.
+- All three commands share the report's `--days` / `--start`/`--end` window
+  (validated before the proxy, same inclusive range `spend` uses), and every
+  output takes `--json` (`window`, `by`/`model`, rows, the endpoint's
+  `metadata` envelope when the proxy sends one).
+- Row shapes vary across proxy versions, so normalization is tolerant the
+  way every reader here is: the user count may arrive as
+  `num_daily_active_users`, `active_users` or a scalar `value`; dict `value`
+  rows expand, a `None` model key is the day total `(all)`; latency metrics
+  flatten onto the day row; junk rows are dropped; dates cut to YYYY-MM-DD;
+  newest day first. A differing live shape is a fixture and a
+  normalize-tweak, not a crash.
+- 13 unit tests (`test_core.py`: paths, escaping, the `--model` requirement,
+  envelopes, every normalization and the forecast fields) and 8
+  e2e/workflow tests (`test_full_e2e.py`: endpoint and body pinning, table
+  and `--json` output, the shared-window workflow — report, activity and
+  predict are asked about the same `--days` window). 489 passed, 94.9%
+  coverage, `ruff check` / `ruff format --check` clean.
+
 ## [0.15.0] — 2026-11-09
 
 The logging callbacks: from a line in readiness to running them.
