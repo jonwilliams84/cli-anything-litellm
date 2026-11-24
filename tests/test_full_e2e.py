@@ -1645,3 +1645,116 @@ def test_workflow_callbacks_config_add_and_delete_stay_consistent():
 
     r7 = run(["callbacks", "list"], get=get)
     assert "datadog" not in r7.output and "langfuse" in r7.output
+
+
+# ── logs get (one request, whole trace) ───────────────────────────────────
+
+
+def trace_row(i, **kw):
+    """The `/spend/log/<id>` row: the /spend/logs row plus its payload columns."""
+    row = log_row(
+        i,
+        metadata={"user_api_key_alias": "svc", "status": "success"},
+        request=json.dumps(
+            {
+                "model": "bedrock/qwen-2.5",
+                "headers": {"Authorization": "Bearer sk-liveabcdefghij", "x-api-key": "real-secret-1"},
+                "messages": [{"role": "user", "content": "count to three"}],
+            }
+        ),
+        response=json.dumps(
+            {
+                "choices": [{"message": {"role": "assistant", "content": "one two three"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            }
+        ),
+    )
+    row.update(kw)
+    return row
+
+
+def trace_proxy(row, **logs_rows):
+    def get(c, p, **k):
+        if p.startswith("/spend/log/"):
+            return row if p[11:] == "req-1" else {}
+        return log_proxy(logs_rows.get("rows", [log_row(1)]))(c, p, **k)
+
+    return get
+
+
+def test_logs_get_pins_the_path_and_the_json_shape():
+    seen = []
+
+    def get(c, p, **k):
+        seen.append(p)
+        return trace_proxy(trace_row(1))(c, p, **k)
+
+    d = json.loads(run(["--json", "logs", "get", "req-1"], get=get).output)
+    assert seen[0] == "/spend/log/req-1"
+    assert d["request_id"] == "req-1" and d["caller"] == "svc" and d["status"] == "success"
+    assert d["latency_ms"] == 2000.0 and d["spend"] == 0.0005
+    assert d["request"]["headers"]["Authorization"] == "****" and d["request"]["headers"]["x-api-key"] == "****"
+    assert d["response"]["choices"][0]["message"]["content"] == "one two three"
+    assert "sk-live" not in json.dumps(d) and "real-secret" not in json.dumps(d)
+
+
+def test_logs_get_quotes_a_weird_id_into_the_path():
+    seen_path = []
+
+    def get(c, p, **k):
+        seen_path.append(p)
+        if p.endswith("chatcmpl%2Fa%20b"):
+            return trace_row(1, request_id="chatcmpl/a b")
+        return {}
+
+    r = run(["--json", "logs", "get", "chatcmpl/a b"], get=get)
+    assert "/spend/log/chatcmpl%2Fa%20b" in seen_path  # first call: the trace itself
+    assert json.loads(r.output)["request_id"] == "chatcmpl/a b"
+
+
+def test_logs_get_human_output_redacts_payloads():
+    r = run(["logs", "get", "req-1"], get=trace_proxy(trace_row(1)))
+    assert "req-1 · qwen" in r.output and "2000.0ms" in r.output and "caller svc" in r.output
+    assert r.output.count("****") == 2 and '"Authorization"' in r.output
+    assert "sk-live" not in r.output and "real-secret" not in r.output
+
+
+def test_logs_get_no_payload_drops_the_columns():
+    r = run(["--json", "logs", "get", "req-1", "--no-payload"], get=trace_proxy(trace_row(1)))
+    d = json.loads(r.output)
+    assert "request" not in d and "response" not in d
+    assert d["status"] == "success" and d["latency_ms"] == 2000.0
+
+
+def test_logs_get_missing_request_is_a_clear_error_not_a_trace():
+    r = run(["logs", "get", "req-404"], get=lambda c, p, **k: (_ for _ in ()).throw(cli_mod.be.ApiError(404, "Not Found", "http://p" + p)))
+    assert r.exit_code != 0 and "no request" in r.output and "asynchronously" in r.output
+
+
+def test_logs_get_empty_envelope_and_absent_payloads():
+    r = run(["--json", "logs", "get", "req-1"], get=trace_proxy({"request_id": "req-1", "model_group": "qwen"}))
+    d = json.loads(r.output)
+    assert d["request_id"] == "req-1" and d["request"] is None and d["response"] is None
+
+
+def test_workflow_logs_list_row_then_get_the_trace():
+    """`logs list` names the row (sha256 key, no payloads); `logs get` reads
+    that same request's heavy row — and masks the secrets only the full
+    trace carries."""
+    rows = [log_row(1)]
+    seen = []
+
+    def get(c, p, **k):
+        seen.append(p)
+        if p.startswith("/spend/log/"):
+            return trace_row(1)
+        return log_proxy(rows)(c, p, **k)
+
+    d = json.loads(run(["--json", "logs", "list"], get=get).output)
+    assert d["rows"][0]["request_id"] == "req-1" and "request" not in d["rows"][0] and SVC_TOKEN not in json.dumps(d)
+
+    r = run(["--json", "logs", "get", d["rows"][0]["request_id"]], get=get)
+    d2 = json.loads(r.output)
+    assert d2["request_id"] == "req-1" and d2["request"]["headers"]["Authorization"] == "****"
+    assert SVC_TOKEN not in r.output and "sk-live" not in r.output
+    assert [p for p in seen if p.startswith("/spend/log/")] == ["/spend/log/req-1"]

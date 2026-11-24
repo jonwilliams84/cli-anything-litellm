@@ -27,9 +27,11 @@ Row shape notes (tolerated variants, as different proxies emit them):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 MODEL_FIELDS = ("model_group", "model")
 TIME_FIELDS = ("startTime", "start_time")
@@ -246,3 +248,119 @@ def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for model, v in sorted(by_model.items(), key=lambda kv: (-kv[1]["spend"], kv[0]))
         ],
     }
+
+
+# ── one request, whole trace ────────────────────────────────────────────────
+#
+# The paged listing (``GET /spend/logs/v2``, what ``logs list`` reads) leaves
+# out the ``request``/``response`` columns — the heavy ones that OOM-killed
+# the unpaged route. The proxy serves one request's full row (payloads
+# included, the columns the Admin UI's request drawer shows) on
+# ``GET /spend/log/{request_id}``. This is the "why was I billed for this /
+# what exactly did this call send" view; payloads can carry secrets, so they
+# are redacted before they reach the CLI's output.
+
+#: Payload field names whose values are masked, whatever they claim to carry:
+#: the auth headers the proxy stores verbatim inside the request payload, and
+#: credential-named fields elsewhere (bare ``key`` is *not* here — model
+#: groups and tag rows use it for non-secret values).
+SECRET_SEGMENTS = (
+    "authorization",
+    "api_key",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "cookie",
+    "bearer",
+)
+
+PAYLOAD_MASK = "****"
+
+#: An ``sk-…`` token seen anywhere in a payload string is masked: the request
+#: column can carry the caller key verbatim in text fields.
+sk_token = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+
+
+def detail_path(request_id: str) -> str:
+    """The ``GET /spend/log/…`` path for one request.
+
+    The id is quoted into the path segment (a proxy that reads it bare would
+    route ``…/log/a/b`` elsewhere), and an empty id is refused before any call.
+    """
+    if not (request_id or "").strip():
+        raise ValueError("no request_id — the log is keyed by one; `logs list` shows what is there")
+    return "/spend/log/" + quote(request_id.strip(), safe="")
+
+
+def unwrap(res: Any) -> dict[str, Any] | None:
+    """The row out of ``GET /spend/log``'s answer, tolerant of the shapes
+    seen across proxy versions: a bare row, ``{"result": …}`` / ``{"log": …}``
+    / ``{"data": …}``, or a one-element list."""
+    if isinstance(res, list):
+        return res[0] if res else None
+    if isinstance(res, dict):
+        for k in ("result", "log", "data"):
+            v = res.get(k)
+            if isinstance(v, list):
+                return v[0] if v else None
+            if isinstance(v, dict):
+                return v
+        return res
+    return None
+
+
+def _secret_name(k: Any) -> bool:
+    if not isinstance(k, str):
+        return False
+    name = k.lower().replace("-", "_").replace("_", "")
+    return any(seg.replace("_", "") in name for seg in SECRET_SEGMENTS)
+
+
+def redact(value: Any) -> Any:
+    """A copy of a payload safe to print: values under credential-named keys
+    are masked whole (an ``os.environ/NAME`` reference names a variable, not a
+    secret, and stays), any other ``sk-…`` token in a string is masked in
+    place, and everything else passes untouched."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if _secret_name(k) and isinstance(v, str) and v and not v.startswith("os.environ/"):
+                out[k] = PAYLOAD_MASK
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if isinstance(value, str):
+        return sk_token.sub(PAYLOAD_MASK, value)
+    return value
+
+
+def payload(row: dict[str, Any], name: str) -> Any:
+    """One payload column, parsed (the proxy stores it as a JSON *string*)
+    and redacted. Unparsable text is kept as a string — with tokens scrubbed;
+    a missing/empty column is ``None``."""
+    v = row.get(name)
+    if v in (None, ""):
+        return None
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return redact(v)
+    return redact(v)
+
+
+def detail(row: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
+    """One request, whole trace: the ``normalize`` row plus what the listing
+    leaves out — the end time, the call's recorded status and the redacted
+    ``request``/``response`` payloads."""
+    end = _dt(row.get("endTime", row.get("end_time")))
+    out = normalize(row, aliases)
+    out["end_time"] = end.astimezone(timezone.utc).isoformat(timespec="seconds") if end else None
+    meta = row.get("metadata") or {}
+    out["status"] = row.get("status") or meta.get("status")
+    out["request"] = payload(row, "request")
+    out["response"] = payload(row, "response")
+    return out

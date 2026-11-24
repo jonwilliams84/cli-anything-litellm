@@ -2,7 +2,7 @@
 
 Administer, tune and audit a [LiteLLM](https://github.com/BerriAI/litellm) proxy from the shell.
 
-- **Inspect:** status, per-deployment health (live, or the proxy's own recorded checks — `health latest` / `health history`, no backend called), model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag).
+- **Inspect:** status, per-deployment health (live, or the proxy's own recorded checks — `health latest` / `health history`, no backend called), model groups and replicas, live router settings, guardrails, recent requests (per-request logs: who called what, tokens, spend, latency, cache — filterable by key, user, team, model and tag) and one request's whole trace (`logs get <request_id>` — the request/response payloads the paged log route leaves out, secrets masked, what the Admin UI's request drawer shows).
 - **Manage:** virtual keys (generate, update limits, block, rotate, delete — tagged for chargeback), user accounts (create with role/team/budget, update, delete), teams (create with members and budget, update, member add/remove, block, delete), budgets (reusable spend limits keys reference by `--budget-id`: create, update, delete — change the cap once instead of re-pricing each key), customers (end users of your app: track and cap by `user_id` — list, create, update, block, delete), DB-only model deployments (`models add` / `models delete` — what the Admin UI does), spend, spend-by-tag.
 - **Routing resilience:** fallback chains (list, show the effective chain — resolved from router settings for group names with `/`, which the proxy's `/fallback/{model}` route cannot match — set, delete, and `fallbacks test` — fail a group on purpose and see which fallback served), and pausing one DB deployment without deleting it (`models block` / `models unblock`). Fallback lists config.yaml owns are refused (the proxy would drop the change on restart).
 - **MCP gateway:** the MCP servers the proxy fronts — list, health, tools, access groups, add/update/delete DB servers, live gateway sessions — and which keys reach which servers (`mcp access`, `keys generate|update --mcp-groups/--mcp-servers`). Secrets embedded in server URLs, headers and env are never printed.
@@ -38,6 +38,7 @@ cli-anything-litellm customers block acme --yes                # their user_id s
 cli-anything-litellm budgets info eng-2026   # the budget and every key/team on it
 cli-anything-litellm budgets update eng-2026 --max-budget 200   # re-prices every attached key
 cli-anything-litellm logs list --key svc --limit 50   # the requests behind `spend` totals
+cli-anything-litellm logs get req-abc123   # one request's whole trace: payloads, status (secrets masked)
 cli-anything-litellm logs summary --team eng   # traffic + latency p50/p95 over the window
 cli-anything-litellm usage report --by day --days 90    # the wide picture, aggregated by the proxy's DB
 cli-anything-litellm usage report --by api_key --start 2026-01-01 --end 2026-01-31  # a monthly spend report

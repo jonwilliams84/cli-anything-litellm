@@ -1113,3 +1113,103 @@ def test_callback_every_fixture_secret_is_masked_in_normalized_rows():
         # a public key is masked the same way under both roles (mask-more, never leak)
         assert any(r["variables"].get("LANGFUSE_PUBLIC_KEY") == "****" for r in rows if r["name"] == "langfuse")
         assert LANGFUSE_PUBLIC not in flat
+
+
+# ── logs get (one request, whole trace) ───────────────────────────────────
+
+
+def trace_row(i=1, **kw):
+    row = log(
+        i,
+        status="success",
+        request=json.dumps(
+            {
+                "model": "bedrock/qwen-2.5",
+                "headers": {"Authorization": "Bearer sk-abcdefghij123456", "x-api-key": "veryreal1234"},
+                "messages": [{"role": "user", "content": "count to three"}],
+            }
+        ),
+        response=json.dumps(
+            {
+                "choices": [{"message": {"role": "assistant", "content": "one two three"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            }
+        ),
+    )
+    row.update(kw)
+    return row
+
+
+def test_detail_path_quotes_the_id_and_refuses_an_empty_one():
+    assert lg.detail_path("req-1") == "/spend/log/req-1"
+    assert lg.detail_path("chatcmpl/a b") == "/spend/log/chatcmpl%2Fa%20b"
+    with pytest.raises(ValueError, match="no request_id"):
+        lg.detail_path(" ")
+
+
+def test_detail_unwraps_envelopes_and_empty_answers():
+    row = {"request_id": "req-1"}
+    assert lg.unwrap(row) == row
+    assert lg.unwrap({"result": row}) == row
+    assert lg.unwrap({"data": [row]}) == row
+    assert lg.unwrap([row]) == row
+    assert lg.unwrap([]) is None
+    assert lg.unwrap(None) is None
+    assert lg.unwrap("junk") is None
+    assert lg.unwrap({"junk": True}) == {"junk": True}
+
+
+def test_detail_keeps_normalize_and_adds_end_status():
+    d = lg.detail(trace_row(), {"b" * 64: "svc"})
+    assert d["request_id"] == "req-1" and d["caller"] == "svc" and d["model"] == "qwen"
+    assert d["when"] == "2026-10-11T00:01:00+00:00" and d["end_time"] == "2026-10-11T00:01:02+00:00"
+    assert d["latency_ms"] == 2000.0 and d["status"] == "success"
+    d = lg.detail(trace_row(status=None, status_x=None))
+    assert d["status"] is None
+    d = lg.detail(trace_row(endTime=None))
+    assert d["end_time"] is None and d["latency_ms"] is None
+
+
+def test_detail_parses_json_string_payloads_and_masks_secret_headers():
+    d = lg.detail(trace_row(), {})
+    assert d["request"]["model"] == "bedrock/qwen-2.5"  # read, not raw text
+    assert d["request"]["headers"]["Authorization"] == "****"  # masked, not parsed apart
+    assert d["request"]["headers"]["x-api-key"] == "****"
+    assert d["request"]["messages"][0]["content"] == "count to three"  # plain fields pass
+    assert d["response"]["choices"][0]["message"]["content"] == "one two three"
+    assert "sk-abcdefghij" not in json.dumps(d) and "veryreal" not in json.dumps(d)
+
+
+def test_detail_masks_a_token_inside_plain_text_and_keeps_environ_refs():
+    row = trace_row(
+        request=json.dumps({"prompt": "use key sk-abcdefghij123456 to sign", "ref": "os.environ/QWEN_KEY"}),
+        response=json.dumps(["a"], ),
+    )
+    d = lg.detail(row, {})
+    assert lg.PAYLOAD_MASK in d["request"]["prompt"]
+    assert "sk-abcdefghij" not in json.dumps(d)
+    assert d["request"]["ref"] == "os.environ/QWEN_KEY"  # names a variable, not a secret
+
+
+def test_detail_keeps_unparsable_payload_as_scrubbed_text():
+    d = lg.detail(trace_row(request="truncated json { sk-abcdefghij123456"), {})
+    assert d["request"] == f"truncated json {{ {lg.PAYLOAD_MASK}"
+
+
+def test_detail_non_dict_json_payload_passes_redacted():
+    d = lg.detail(trace_row(request=json.dumps([1, 2]), response="null"), {})
+    assert d["request"] == [1, 2]
+    assert d["response"] is None  # json "null" parses to None like a blank column
+
+
+def test_detail_absent_payload_columns_are_none():
+    d = lg.detail(log(), {})
+    assert d["request"] is None and d["response"] is None and d["status"] is None
+
+
+def test_redact_does_not_treat_bare_key_names_as_secret():
+    tree = {"model_group": "qwen", "key_alias": "svc", "session_token_id": "opaque", "nested": {"token_count": 5}}
+    got = lg.redact(tree)
+    assert got["key_alias"] == "svc" and got["model_group"] == "qwen"
+    assert got["session_token_id"] == lg.PAYLOAD_MASK  # a credential-named value, at any depth
+    assert got["nested"]["token_count"] == 5  # a count named token is not a secret: still passes

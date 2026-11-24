@@ -105,6 +105,7 @@ cli-anything-litellm config test                  # reachability + auth + versio
 | How much does one feature (or project, or cost centre) cost? | `spend --by tag` — keys tagged with `keys generate|update --tags`; a request riding several tags is counted under each, `(untagged)` for none |
 | Which requests are behind that number? Who called what, at what latency? | `logs list [--key svc|sk-...|--user U|--team T|--model M|--tag T] [--days 7] [--limit 25]` — one row per request, newest first (tokens, spend, latency, cache hit) |
 | Is traffic healthy: throughput, latency tail, cache hits per model? | `logs summary [--key ...|--user ...|--team ...|--model M|--tag T] [--days 7]` |
+| What exactly did one request send and get back (why was I billed for this)? | `logs get <request_id>` — the row's full trace incl. the request/response payloads `logs list` leaves out (`--no-payload` for summary fields only); auth headers, credential-named values and sk- tokens in the payloads are masked |
 | MCP: which servers does the gateway front, are they up? | `mcp list [--health]` (`SRC=config` = config.yaml, read-only here; `db` = added via API/UI), `mcp health [SERVER...]` (exit 2 = one is unhealthy), `mcp info <id|alias|name>` (secrets redacted) |
 | MCP: what tools does a client see? | `mcp tools [--server S]` — for the key the CLI runs as; `mcp groups` — each access group and its servers |
 | MCP: which keys reach which servers? | `mcp access [--server S] [--team T]` — from each key's own `object_permission`; `(inherited: team:…/org:…/role:…)` only where one could grant servers, otherwise `(none)` (the gateway denies such a key) |
@@ -172,6 +173,9 @@ pin a row over a config-owned cache — see traps).
   callers are named from the live key list or the alias recorded at request time
   (`svc (gone)` for renamed, rotated or deleted keys). The window filter is
   server-side (`--days`); key/user/team/model filters are applied client-side.
+  A row that *is* there can be read in full with `logs get <request_id>`
+  (`GET /spend/log/<id>`) — the payload columns `logs list` leaves out; a 404
+  there means the proxy never logged (or already dropped) it.
 - **`health` is not free.** It sends a completion to every deployment. On a
   metered upstream that costs money; on local vLLM it adds load. `health
   latest` / `health history` read the proxy's recorded checks instead.

@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.17.0] — 2026-11-24
+
+`logs list` and `logs summary` read the paged log route (`/spend/logs/v2`),
+which deliberately leaves out the `request`/`response` columns — the heavy
+payload fields that OOM-killed the old unpaged route. But that means the
+CLI could say *this* request cost $0.0005 and took 2s, and never *what it
+actually sent, what came back, or how the call ended*. The proxy serves
+exactly that, one request at a time, on `GET /spend/log/{request_id}` — the
+columns the Admin UI's request drawer reads. Now:
+
+- **`logs get <request_id>`** — one request, whole trace: the `logs list`
+  row (caller, tokens, spend, latency, cache) plus what the listing leaves
+  out — the end time, the call's recorded status, and the parsed
+  request/response payloads. Secrets in the payloads are masked before they
+  are printed: auth headers and every credential-named field (at any depth)
+  go out as `****` (an `os.environ/NAME` reference is kept — it names a
+  variable, not a secret), and any `sk-…` token seen in a payload string is
+  masked in place. `--no-payload` prints the summary fields only.
+- The row shapes vary across proxy versions, so the answer is unwrapped
+  tolerantly (bare row, `{"result": …}` / `{"log": …}` / `{"data": …}`, or a
+  one-element list), payloads arrive as JSON *strings* and are parsed (an
+  unparsable one stays as text — tokens scrubbed), and timestamps keep the
+  listing's tolerance (ISO-8601 or epoch seconds). A request the proxy never
+  logged is a 404 turned into a pointer at `logs list` (the log is written
+  asynchronously, and only kept for a while), not a stack trace.
+- The request id is quoted into the path segment (a proxy that would route
+  `…/log/a/b` elsewhere cannot be tripped by a `chatcmpl/a b` id), and an
+  empty id is refused before the proxy is called.
+- 9 unit tests (`test_core.py`: the path quoting, every unwrap shape, the
+  payload parsing and each redaction rule, the bare-`key`-names-are-not-
+  secrets line that keeps `key_alias` readable) and 7 e2e/workflow tests
+  (`test_full_e2e.py`: the pinned `/spend/log/<id>` path, the quoted weird
+  id, table and `--json` output with no secret in either, `--no-payload`,
+  the 404-as-message, and the drill-down workflow — a row in `logs list`
+  becomes a full trace with the same request id, caller and hashes still
+  hidden). 506 passed, 94.91% coverage, `ruff check` / `ruff format
+  --check` clean.
+
 ## [0.16.0] — 2026-11-16
 
 The Usage tab is more than money. `usage report` asked the proxy's
