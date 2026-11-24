@@ -3105,6 +3105,59 @@ def logs_summary(ctx, key, user, team, model, tag, days):
     )
 
 
+@logs_grp.command("get")
+@click.argument("request_id")
+@click.option("--no-payload", is_flag=True, help="Summary fields only, without request/response payloads.")
+@click.pass_context
+def logs_get(ctx, request_id, no_payload):
+    """One request, whole trace: the payload columns `logs list` leaves out.
+
+    Reads `GET /spend/log/<request_id>` — the Admin UI's request drawer. The
+    paged log route `logs list` uses deliberately leaves out the
+    request/response columns (they are the heavy ones); this is what to look
+    at when a row there needs explaining. Secrets in the payloads (auth
+    headers, credential-named fields, sk- tokens) are masked.
+    """
+    c = _conn(ctx)
+    try:
+        path = logs_mod.detail_path(request_id)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    try:
+        row = logs_mod.unwrap(be.get(c, path))
+    except be.ApiError as e:
+        if e.status == 404:
+            raise click.ClickException(
+                f"no request {request_id!r} in the log — logs are written asynchronously,"
+                " and only kept for a while: `logs list` shows what is there"
+            ) from e
+        raise _api_error(e) from e
+    if row is None:
+        raise click.ClickException(f"no request {request_id!r} in the log — `logs list` shows what is there")
+    d = logs_mod.detail(row, _aliases(c))
+    if no_payload:
+        d.pop("request")
+        d.pop("response")
+
+    def human(d):
+        status = f" · status {d['status']}" if d.get("status") else ""
+        click.echo(
+            f"{d['request_id']} · {d['model']} · {d['when']} → {d['end_time']} · {d['latency_ms']}ms · ${d['spend']}{status}"
+        )
+        click.echo(
+            f"call {d['call_type']} · caller {d['caller']} · user {d['user']} · team {d['team_id']}"
+            f" · {d['prompt_tokens']}+{d['completion_tokens']} tokens"
+            f" · {'cache hit' if d['cache_hit'] else 'cache miss'}"
+        )
+        for name, p in (("request", d.get("request")), ("response", d.get("response"))):
+            if p is None:
+                continue
+            click.echo(f"{name}:")
+            click.echo(json.dumps(p, indent=2, default=str))
+
+    _emit(ctx, d, human)
+
+
 # ── spend ───────────────────────────────────────────────────────────────────
 
 
