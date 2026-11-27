@@ -22,9 +22,32 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 MAX_SHOWN = 200
+# Transient GitHub-side failures: on 2026-11-25 every gh issue edit in this repo
+# died with a transient GraphQL error ("Something went wrong while executing
+# your query") and the Findings Summary job went red although the SARIF uploads
+# and both issues were perfectly healthy - the runs the day before and the day
+# after, on identical code, passed. These markers cover gh/GitHub's transient
+# wording (GraphQL hiccups, 5xx, connection drops); they deliberately do NOT
+# cover permanent errors (404, 422, auth failures), which still fail on the
+# first attempt.
+TRANSIENT_ATTEMPTS = 4
+TRANSIENT_BASE_DELAY = 15  # seconds; escalated per retry on a real run
+_TRANSIENT_MARKERS = (
+    "something went wrong",
+    "there was a technical problem",
+    "bad gateway",
+    "service unavailable",
+    "server error",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "http 5",  # 500/502/503/504 from the REST API
+)
 SECURITY_LABEL = "security-findings"
 QUALITY_LABEL = "code-quality"
 SECURITY_TITLE = "\U0001f512 Security findings - auto-generated"
@@ -36,6 +59,12 @@ _LEVEL_RANK = {"error": 0, "warning": 1, "note": 2, "none": 3}
 def is_test_path(path: str) -> bool:
     base = os.path.basename(path)
     return "/tests/" in path or base.startswith("test_") or base == "conftest.py"
+
+
+def is_transient(text: str) -> bool:
+    """True when the gh output looks like a GitHub-side transient failure."""
+    lowered = (text or "").lower()
+    return any(m in lowered for m in _TRANSIENT_MARKERS)
 
 
 def sort_key(f: dict) -> tuple:
@@ -173,16 +202,38 @@ def build_body(findings: list[dict], scan_date: str, kind: str) -> str:
 
 
 def _run(cmd: list[str], what: str) -> subprocess.CompletedProcess:
-    """Run a gh command and REPORT failure instead of swallowing it.
+    """Run a gh command, retry GitHub transients, and REPORT failure otherwise.
 
-    Every call here used to pass check=False with the result ignored, so the
-    script printed "created issue" and exited 0 whether or not anything was
-    created. That is exactly how the code-quality split silently never landed:
-    `gh issue create --label code-quality` fails when the label does not exist,
-    the scan reported success, and no code-quality issue was ever published in
-    any of the six repos (found 2026-07-26).
+    Two failure modes are handled here, and neither is swallowed:
+
+    1. Every call used to pass check=False with the result ignored, so the
+       script printed "created issue" and exited 0 whether or not anything was
+       created. That is exactly how the code-quality split silently never
+       landed: `gh issue create --label code-quality` fails when the label does
+       not exist, the scan reported success, and no code-quality issue was ever
+       published in any of the six repos (found 2026-07-26).
+
+    2. Transient GitHub-side errors now get escalating-backoff retries. The
+       2026-11-25 run failed here with `GraphQL: Something went wrong while
+       executing your query` on both issue edits - a GitHub hiccup, not a repo
+       problem. A transient that still fails after TRANSIENT_ATTEMPTS attempts
+       (or any permanent error, which is never retried) is reported and fails
+       the caller; the check itself is not weakened.
     """
     res = subprocess.run(cmd, capture_output=True, text=True)
+    attempt = 1
+    while (
+        res.returncode != 0
+        and attempt < TRANSIENT_ATTEMPTS
+        and is_transient((res.stderr or "") + (res.stdout or ""))
+    ):
+        print(
+            f"::warning::{what} hit a transient GitHub error on attempt "
+            f"{attempt}: {(res.stderr or res.stdout).strip()[:200]} - retrying"
+        )
+        time.sleep(TRANSIENT_BASE_DELAY * attempt)
+        attempt += 1
+        res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"::error::{what} failed (exit {res.returncode}): "
               f"{(res.stderr or res.stdout).strip()[:400]}")

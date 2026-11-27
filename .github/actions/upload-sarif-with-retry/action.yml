@@ -1,0 +1,52 @@
+name: Upload SARIF with retry
+description: >-
+  github/codeql-action/upload-sarif@v4 wrapped with up to three attempts and a
+  wait between them. The 2026-11-25 security-scan run failed all three SARIF
+  uploads (bandit, semgrep, pip-audit) inside one 90-second window when GitHub's
+  code-scanning API was erroring fleet-wide (the same run's gh issue edits died
+  with transient GraphQL errors, and the runs before and after on identical
+  code passed). This makes the upload ride out such a window without weakening
+  anything: three failed attempts in a row still fail the job.
+inputs:
+  sarif_file:
+    description: Path of the SARIF file to upload
+    required: true
+  category:
+    description: Code scanning category (bandit / semgrep / pip-audit)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: First upload attempt
+      id: first
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif_file }}
+        category: ${{ inputs.category }}
+      continue-on-error: true
+
+    - name: Wait before second attempt
+      if: steps.first.outcome == 'failure'
+      shell: bash
+      run: sleep 30
+
+    - name: Second upload attempt
+      id: second
+      if: steps.first.outcome == 'failure'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif_file }}
+        category: ${{ inputs.category }}
+      continue-on-error: true
+
+    - name: Wait before final attempt
+      if: steps.second.outcome == 'failure'
+      shell: bash
+      run: sleep 60
+
+    - name: Final upload attempt (job fails if this fails)
+      if: steps.second.outcome == 'failure'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif_file }}
+        category: ${{ inputs.category }}

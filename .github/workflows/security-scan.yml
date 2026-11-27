@@ -91,50 +91,18 @@ jobs:
             bandit -r . -x "$BANDIT_EXCLUDE" -f json -o bandit.json || true
           fi
       - name: Convert bandit JSON to SARIF
-        run: |
-          python3 -c "
-          import json
-          with open('bandit.json') as f:
-              data = json.load(f)
-          seen_rules = set()
-          rules = []
-          results = []
-          for r in data.get('results', []):
-              rid = r.get('test_id', 'unknown')
-              if rid not in seen_rules:
-                  seen_rules.add(rid)
-                  rules.append({
-                      'id': rid,
-                      'shortDescription': {'text': r.get('test_name', rid)},
-                      'fullDescription': {'text': r.get('test_description', '')},
-                      'helpUri': r.get('issue_cwe', {}).get('link', '')
-                  })
-              sev = r.get('issue_severity', 'LOW')
-              level = 'error' if sev in ('HIGH', 'MEDIUM') else 'warning'
-              results.append({
-                  'ruleId': rid,
-                  'level': level,
-                  'message': {'text': r.get('issue_text', '')},
-                  'locations': [{
-                      'physicalLocation': {
-                          'artifactLocation': {'uri': r.get('filename', 'unknown')},
-                          'region': {'startLine': r.get('line_number', 0)}
-                      }
-                  }]
-              })
-          sarif = {
-              'version': '2.1.0',
-              'runs': [{
-                  'tool': {'driver': {'name': 'Bandit', 'rules': rules}},
-                  'results': results
-              }]
-          }
-          with open('bandit.sarif', 'w') as f:
-              json.dump(sarif, f, indent=2)
-          print(f'Converted {len(results)} bandit findings to SARIF')
-          "
+        # Use the reviewed converter in .github/scripts/ like pip-audit does.
+        # The inline copy had no missing-file guard, so a bandit crash turned
+        # into FileNotFoundError on conversion and a red upload step; the
+        # script degrades to valid empty SARIF instead (see its docstring).
+        run: python .github/scripts/bandit_to_sarif.py bandit.json bandit.sarif
       - name: Upload bandit SARIF
-        uses: github/codeql-action/upload-sarif@v4
+        # Retry wrapper: GitHub's code-scanning API dropped all three uploads
+        # of the 2026-11-25 run inside one 90-second window while the findings
+        # issue edits were dying with transient GraphQL errors; the runs either
+        # side, on identical code, passed. Three failed attempts still fail
+        # the job - a persistent outage is a red run, as before.
+        uses: ./.github/actions/upload-sarif-with-retry
         with:
           sarif_file: bandit.sarif
           category: bandit
@@ -162,7 +130,8 @@ jobs:
               --sarif --output semgrep.sarif . || true
           fi
       - name: Upload semgrep SARIF
-        uses: github/codeql-action/upload-sarif@v4
+        # Retry wrapper: see the bandit upload step for why.
+        uses: ./.github/actions/upload-sarif-with-retry
         with:
           sarif_file: semgrep.sarif
           category: semgrep
@@ -215,7 +184,8 @@ jobs:
         # the script does. Same reason publish_findings.py was extracted.
         run: python .github/scripts/pip_audit_to_sarif.py pip-audit.json pip-audit.sarif
       - name: Upload pip-audit SARIF
-        uses: github/codeql-action/upload-sarif@v4
+        # Retry wrapper: see the bandit upload step for why.
+        uses: ./.github/actions/upload-sarif-with-retry
         with:
           sarif_file: pip-audit.sarif
           category: pip-audit
