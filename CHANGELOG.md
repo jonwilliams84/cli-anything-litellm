@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.17.1] — 2026-11-27
+
+CI fix (Security Scan); no CLI behaviour change. The 2026-11-25 06:00 UTC run
+failed four jobs on main — Semgrep/Dependency Audit/Bandit at their SARIF
+upload steps and Findings Summary at the issue update — inside one 90-second
+window when GitHub's own API was erroring fleet-wide: `gh issue edit` died with
+a transient GraphQL "Something went wrong while executing your query", all
+three `upload-sarif` steps died silently mid-upload, and runs either side on
+identical code passed. The pipeline had no tolerance for that; now it does.
+
+- `publish_findings.py` retries transient GitHub failures ("Something went
+  wrong", 5xx, timeouts, connection resets) with escalating backoff before
+  reporting failure; permanent errors (404/422/auth) are never retried, so a
+  genuinely broken publish still fails the job loudly.
+- New composite action `.github/actions/upload-sarif-with-retry` wraps all
+  three `github/codeql-action/upload-sarif@v4` steps (bandit, semgrep,
+  pip-audit) with up to three attempts and a wait between them. Three failed
+  attempts in a row still fail the job — a persistent outage stays red.
+- The bandit job's inline JSON→SARIF converter is replaced by the reviewed
+  `.github/scripts/bandit_to_sarif.py`: a bandit crash no longer turns the
+  conversion into `FileNotFoundError` — the script emits valid empty SARIF,
+  exactly like the pip-audit converter it was extracted alongside.
+- Regression tests pin the behaviour, not the source: transient failure healed,
+  persistent transient exhausted then failed, permanent failure not retried,
+  and both converters emitting valid SARIF on a missing report.
+
+
 ## [0.17.0] — 2026-11-24
 
 `logs list` and `logs summary` read the paged log route (`/spend/logs/v2`),
